@@ -6,7 +6,7 @@
   "scripts": {
     "dev": "ts-node-dev src/server.ts",
     "worker": "ts-node-dev src/workers/analyticsWorker.ts",
-    "build": "tsc && npx prisma generate",
+    "build": "tsc -p tsconfig.build.json && npx prisma generate",
     "start": "node dist/server.js",
     "start:worker": "node dist/workers/analyticsWorker.js",
     "test": "echo \"Error: no test specified\" && exit 1"

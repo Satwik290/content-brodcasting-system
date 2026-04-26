@@ -1,5 +1,5 @@
 import { describe, it, expect } from '@jest/globals';
-import { SchedulingService, ContentWithSchedule } from '../../../services/scheduling.service';
+import { SchedulingService, ContentWithSchedule } from '../../../src/services/scheduling.service';
 import { Content, ContentSchedule } from '@prisma/client';
 
 describe('SchedulingService (ADR-002 Pure Function)', () => {
