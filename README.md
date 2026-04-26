@@ -84,9 +84,13 @@ npx prisma generate
 # Development (hot reload)
 npm run dev
 
-# Start analytics worker (separate terminal)
+# Start analytics worker (separate terminal — REQUIRED for Analytics)
 npm run worker
 ```
+
+### 6. Testing with Postman
+A comprehensive Postman collection is provided in the root directory: [`postman-collection.json`](./postman-collection.json).
+It includes automated scripts to manage tokens and IDs for a seamless testing workflow.
 
 ---
 
