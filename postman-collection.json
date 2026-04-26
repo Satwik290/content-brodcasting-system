@@ -1,8 +1,8 @@
 {
   "info": {
-    "name": "Content Broadcasting System API - PRO",
-    "_postman_id": "cbs-api-collection-v1-hardened",
-    "description": "Comprehensive API collection for the Content Broadcasting System. Includes Auth, Teacher flows, Principal workflows, Public broadcasting, and Analytics. \n\n**Variables Required:**\n- `baseUrl`: http://localhost:3000/api/v1\n- `teacherToken`: Set automatically after Teacher Login\n- `principalToken`: Set automatically after Principal Login",
+    "name": "Content Broadcasting System API - Complete v2.0",
+    "_postman_id": "cbs-api-complete-v2",
+    "description": "Complete API collection for Content Broadcasting System with:\n- Auth flows (Register, Login, Logout)\n- Teacher workflows (Upload, View Uploads)\n- Principal workflows (Review, Approve, Reject)\n- Public Broadcasting (Live Feed)\n- User Management\n- Analytics\n\n**Setup Instructions:**\n1. Set baseUrl: http://localhost:3000/api/v1\n2. Run 'Register Teacher' first\n3. Run 'Register Principal' second\n4. Run 'Login as Teacher' (auto-sets teacherToken)\n5. Run 'Login as Principal' (auto-sets principalToken)\n6. Use 'Upload Content' to create content\n7. Use 'View Pending Reviews' to see it\n8. Approve/Reject as needed",
     "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
   },
   "variable": [
@@ -10,47 +10,29 @@
     { "key": "teacherToken", "value": "", "type": "string" },
     { "key": "principalToken", "value": "", "type": "string" },
     { "key": "teacherId", "value": "", "type": "string" },
-    { "key": "contentId", "value": "", "type": "string" }
+    { "key": "contentId", "value": "", "type": "string" },
+    { "key": "timestamp", "value": "", "type": "string" }
   ],
   "item": [
     {
-      "name": "01. Auth Module",
+      "name": "00. SETUP (Run these first)",
       "item": [
         {
-          "name": "Register Teacher",
-          "request": {
-            "method": "POST",
-            "header": [{ "key": "Content-Type", "value": "application/json" }],
-            "url": { "raw": "{{baseUrl}}/auth/register", "host": ["{{baseUrl}}"], "path": ["auth", "register"] },
-            "body": {
-              "mode": "raw",
-              "raw": "{\n  \"name\": \"John Teacher\",\n  \"email\": \"teacher@school.com\",\n  \"password\": \"Password123!\",\n  \"role\": \"TEACHER\"\n}"
-            }
-          }
-        },
-        {
-          "name": "Register Principal",
-          "request": {
-            "method": "POST",
-            "header": [{ "key": "Content-Type", "value": "application/json" }],
-            "url": { "raw": "{{baseUrl}}/auth/register", "host": ["{{baseUrl}}"], "path": ["auth", "register"] },
-            "body": {
-              "mode": "raw",
-              "raw": "{\n  \"name\": \"Principal Smith\",\n  \"email\": \"principal@school.com\",\n  \"password\": \"Admin123!\",\n  \"role\": \"PRINCIPAL\"\n}"
-            }
-          }
-        },
-        {
-          "name": "Login as Teacher",
+          "name": "0.1 - Register Teacher Account",
           "event": [
             {
               "listen": "test",
               "script": {
                 "exec": [
                   "const response = pm.response.json();",
-                  "if (response.success) {",
+                  "console.log('Register Teacher Response:', response);",
+                  "",
+                  "if (response.success && response.data?.token) {",
                   "    pm.collectionVariables.set('teacherToken', response.data.token);",
                   "    pm.collectionVariables.set('teacherId', response.data.user.id);",
+                  "    console.log('✅ Teacher token saved:', response.data.user.email);",
+                  "} else {",
+                  "    console.log('❌ Failed to register teacher');",
                   "}"
                 ],
                 "type": "text/javascript"
@@ -59,11 +41,98 @@
           ],
           "request": {
             "method": "POST",
-            "header": [{ "key": "Content-Type", "value": "application/json" }],
-            "url": { "raw": "{{baseUrl}}/auth/login", "host": ["{{baseUrl}}"], "path": ["auth", "login"] },
+            "header": [
+              { "key": "Content-Type", "value": "application/json" }
+            ],
             "body": {
               "mode": "raw",
-              "raw": "{\n  \"email\": \"teacher@school.com\",\n  \"password\": \"Password123!\"\n}"
+              "raw": "{\n  \"name\": \"John Teacher\",\n  \"email\": \"teacher.{{$timestamp}}@school.com\",\n  \"password\": \"TeacherPass123!\",\n  \"role\": \"TEACHER\"\n}"
+            },
+            "url": {
+              "raw": "{{baseUrl}}/auth/register",
+              "host": ["{{baseUrl}}"],
+              "path": ["auth", "register"]
+            }
+          }
+        },
+        {
+          "name": "0.2 - Register Principal Account",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "const response = pm.response.json();",
+                  "console.log('Register Principal Response:', response);",
+                  "",
+                  "if (response.success && response.data?.token) {",
+                  "    pm.collectionVariables.set('principalToken', response.data.token);",
+                  "    console.log('✅ Principal token saved:', response.data.user.email);",
+                  "} else {",
+                  "    console.log('❌ Failed to register principal');",
+                  "}"
+                ],
+                "type": "text/javascript"
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"name\": \"Principal Smith\",\n  \"email\": \"principal.{{$timestamp}}@school.com\",\n  \"password\": \"PrincipalPass123!\",\n  \"role\": \"PRINCIPAL\"\n}"
+            },
+            "url": {
+              "raw": "{{baseUrl}}/auth/register",
+              "host": ["{{baseUrl}}"],
+              "path": ["auth", "register"]
+            }
+          }
+        }
+      ]
+    },
+    {
+      "name": "01. Authentication",
+      "item": [
+        {
+          "name": "Login as Teacher",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "const response = pm.response.json();",
+                  "console.log('Teacher Login Response:', response);",
+                  "",
+                  "if (response.success && response.data?.token) {",
+                  "    pm.collectionVariables.set('teacherToken', response.data.token);",
+                  "    pm.collectionVariables.set('teacherId', response.data.user.id);",
+                  "    console.log('✅ Logged in as:', response.data.user.email);",
+                  "    console.log('✅ Token saved - ready to upload content');",
+                  "} else {",
+                  "    console.log('❌ Login failed');",
+                  "}"
+                ],
+                "type": "text/javascript"
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"email\": \"teacher.1234567890123@school.com\",\n  \"password\": \"TeacherPass123!\"\n}"
+            },
+            "url": {
+              "raw": "{{baseUrl}}/auth/login",
+              "host": ["{{baseUrl}}"],
+              "path": ["auth", "login"]
             }
           }
         },
@@ -75,8 +144,14 @@
               "script": {
                 "exec": [
                   "const response = pm.response.json();",
-                  "if (response.success) {",
+                  "console.log('Principal Login Response:', response);",
+                  "",
+                  "if (response.success && response.data?.token) {",
                   "    pm.collectionVariables.set('principalToken', response.data.token);",
+                  "    console.log('✅ Logged in as:', response.data.user.email);",
+                  "    console.log('✅ Token saved - ready to review content');",
+                  "} else {",
+                  "    console.log('❌ Login failed');",
                   "}"
                 ],
                 "type": "text/javascript"
@@ -85,11 +160,17 @@
           ],
           "request": {
             "method": "POST",
-            "header": [{ "key": "Content-Type", "value": "application/json" }],
-            "url": { "raw": "{{baseUrl}}/auth/login", "host": ["{{baseUrl}}"], "path": ["auth", "login"] },
+            "header": [
+              { "key": "Content-Type", "value": "application/json" }
+            ],
             "body": {
               "mode": "raw",
-              "raw": "{\n  \"email\": \"principal@school.com\",\n  \"password\": \"Admin123!\"\n}"
+              "raw": "{\n  \"email\": \"principal.1234567890123@school.com\",\n  \"password\": \"PrincipalPass123!\"\n}"
+            },
+            "url": {
+              "raw": "{{baseUrl}}/auth/login",
+              "host": ["{{baseUrl}}"],
+              "path": ["auth", "login"]
             }
           }
         },
@@ -104,6 +185,7 @@
                   "if (response.success) {",
                   "    pm.collectionVariables.set('teacherToken', '');",
                   "    pm.collectionVariables.set('principalToken', '');",
+                  "    console.log('✅ Logged out - tokens cleared');",
                   "}"
                 ],
                 "type": "text/javascript"
@@ -113,26 +195,53 @@
           "request": {
             "method": "POST",
             "header": [
-              { "key": "Authorization", "value": "Bearer {{teacherToken}}" }
+              { "key": "Authorization", "value": "Bearer {{teacherToken}}" },
+              { "key": "Content-Type", "value": "application/json" }
             ],
-            "url": { "raw": "{{baseUrl}}/auth/logout", "host": ["{{baseUrl}}"], "path": ["auth", "logout"] }
+            "url": {
+              "raw": "{{baseUrl}}/auth/logout",
+              "host": ["{{baseUrl}}"],
+              "path": ["auth", "logout"]
+            }
           }
         }
       ]
     },
     {
-      "name": "02. Teacher Module",
+      "name": "02. Teacher - Upload Content",
       "item": [
         {
-          "name": "Upload Content",
+          "name": "Upload Image - Math Quiz",
           "event": [
+            {
+              "listen": "prerequest",
+              "script": {
+                "exec": [
+                  "const now = new Date();",
+                  "const startTime = now.toISOString();",
+                  "const endTime = new Date(now.getTime() + 8 * 3600 * 1000).toISOString(); // 8 hours from now",
+                  "pm.collectionVariables.set('startTime', startTime);",
+                  "pm.collectionVariables.set('endTime', endTime);"
+                ],
+                "type": "text/javascript"
+              }
+            },
             {
               "listen": "test",
               "script": {
                 "exec": [
                   "const response = pm.response.json();",
-                  "if (response.success) {",
+                  "console.log('Upload Response:', response);",
+                  "",
+                  "if (response.success && response.data?.id) {",
                   "    pm.collectionVariables.set('contentId', response.data.id);",
+                  "    console.log('✅ Content uploaded successfully');",
+                  "    console.log('   Content ID:', response.data.id);",
+                  "    console.log('   Status:', response.data.status);",
+                  "    console.log('   Subject:', response.data.subject);",
+                  "    console.log('   👉 Next: View Pending Reviews (as Principal)');",
+                  "} else {",
+                  "    console.log('❌ Upload failed:', response.error?.message);",
                   "}"
                 ],
                 "type": "text/javascript"
@@ -148,23 +257,184 @@
             "body": {
               "mode": "formdata",
               "formdata": [
-                { "key": "file", "type": "file", "src": [] },
-                { "key": "title", "value": "Maths Quiz Week 1", "type": "text" },
-                { "key": "subject", "value": "maths", "type": "text" },
-                { "key": "description", "value": "Basic addition and subtraction", "type": "text" },
-                { "key": "startTime", "value": "{{$isoTimestamp}}", "type": "text" },
-                { "key": "endTime", "value": "2026-05-01T00:00:00Z", "type": "text" },
-                { "key": "rotationDuration", "value": "5", "type": "text" }
+                {
+                  "key": "title",
+                  "value": "Mathematics Quiz - Basic Arithmetic",
+                  "type": "text"
+                },
+                {
+                  "key": "subject",
+                  "value": "maths",
+                  "type": "text"
+                },
+                {
+                  "key": "description",
+                  "value": "Weekly quiz covering addition, subtraction, and multiplication for Grade 3",
+                  "type": "text"
+                },
+                {
+                  "key": "file",
+                  "type": "file",
+                  "src": []
+                },
+                {
+                  "key": "startTime",
+                  "value": "{{startTime}}",
+                  "type": "text"
+                },
+                {
+                  "key": "endTime",
+                  "value": "{{endTime}}",
+                  "type": "text"
+                },
+                {
+                  "key": "rotationDuration",
+                  "value": "5",
+                  "type": "text"
+                }
               ]
             },
-            "url": { "raw": "{{baseUrl}}/content/upload", "host": ["{{baseUrl}}"], "path": ["content", "upload"] }
+            "url": {
+              "raw": "{{baseUrl}}/content/upload",
+              "host": ["{{baseUrl}}"],
+              "path": ["content", "upload"]
+            }
           }
         },
         {
-          "name": "My Uploads",
+          "name": "Upload Image - Science Experiment",
+          "event": [
+            {
+              "listen": "prerequest",
+              "script": {
+                "exec": [
+                  "const now = new Date();",
+                  "const startTime = now.toISOString();",
+                  "const endTime = new Date(now.getTime() + 8 * 3600 * 1000).toISOString();",
+                  "pm.collectionVariables.set('startTime', startTime);",
+                  "pm.collectionVariables.set('endTime', endTime);"
+                ],
+                "type": "text/javascript"
+              }
+            },
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "const response = pm.response.json();",
+                  "if (response.success) {",
+                  "    console.log('✅ Science content uploaded:', response.data.title);",
+                  "    console.log('   Content ID:', response.data.id);",
+                  "}"
+                ],
+                "type": "text/javascript"
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Authorization", "value": "Bearer {{teacherToken}}" },
+              { "key": "Idempotency-Key", "value": "{{$guid}}" }
+            ],
+            "body": {
+              "mode": "formdata",
+              "formdata": [
+                {
+                  "key": "title",
+                  "value": "Science Experiment - Water Cycle",
+                  "type": "text"
+                },
+                {
+                  "key": "subject",
+                  "value": "science",
+                  "type": "text"
+                },
+                {
+                  "key": "description",
+                  "value": "Visual explanation of evaporation, condensation, and precipitation",
+                  "type": "text"
+                },
+                {
+                  "key": "file",
+                  "type": "file",
+                  "src": []
+                },
+                {
+                  "key": "startTime",
+                  "value": "{{startTime}}",
+                  "type": "text"
+                },
+                {
+                  "key": "endTime",
+                  "value": "{{endTime}}",
+                  "type": "text"
+                },
+                {
+                  "key": "rotationDuration",
+                  "value": "5",
+                  "type": "text"
+                }
+              ]
+            },
+            "url": {
+              "raw": "{{baseUrl}}/content/upload",
+              "host": ["{{baseUrl}}"],
+              "path": ["content", "upload"]
+            }
+          }
+        }
+      ]
+    },
+    {
+      "name": "03. Teacher - View Uploads",
+      "item": [
+        {
+          "name": "View My Uploads (All)",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "const response = pm.response.json();",
+                  "console.log('Your Uploads:', response.data);",
+                  "",
+                  "if (response.data?.items?.length > 0) {",
+                  "    console.log('✅ Found', response.data.items.length, 'uploads');",
+                  "    response.data.items.forEach((item, i) => {",
+                  "        console.log(`  ${i+1}. ${item.title} (${item.status})`);",
+                  "    });",
+                  "} else {",
+                  "    console.log('No uploads yet');",
+                  "}"
+                ],
+                "type": "text/javascript"
+              }
+            }
+          ],
           "request": {
             "method": "GET",
-            "header": [{ "key": "Authorization", "value": "Bearer {{teacherToken}}" }],
+            "header": [
+              { "key": "Authorization", "value": "Bearer {{teacherToken}}" }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/content/my-uploads?limit=10&offset=0",
+              "host": ["{{baseUrl}}"],
+              "path": ["content", "my-uploads"],
+              "query": [
+                { "key": "limit", "value": "10" },
+                { "key": "offset", "value": "0" }
+              ]
+            }
+          }
+        },
+        {
+          "name": "View My Uploads (Math Only)",
+          "request": {
+            "method": "GET",
+            "header": [
+              { "key": "Authorization", "value": "Bearer {{teacherToken}}" }
+            ],
             "url": {
               "raw": "{{baseUrl}}/content/my-uploads?subject=maths&limit=10",
               "host": ["{{baseUrl}}"],
@@ -179,108 +449,603 @@
       ]
     },
     {
-      "name": "03. Principal Module",
+      "name": "04. Principal - Review & Approve",
       "item": [
         {
           "name": "View Pending Reviews",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "const response = pm.response.json();",
+                  "console.log('Pending Reviews:', response.data);",
+                  "",
+                  "if (response.data?.items?.length > 0) {",
+                  "    console.log('✅ Found', response.data.items.length, 'pending content');",
+                  "    response.data.items.forEach((item, i) => {",
+                  "        console.log(`  ${i+1}. ${item.title} (by ${item.author?.name})`);",
+                  "        pm.collectionVariables.set('contentId', item.id);",
+                  "        console.log('     👉 ID saved:', item.id);",
+                  "    });",
+                  "} else {",
+                  "    console.log('No pending reviews');",
+                  "}"
+                ],
+                "type": "text/javascript"
+              }
+            }
+          ],
           "request": {
             "method": "GET",
-            "header": [{ "key": "Authorization", "value": "Bearer {{principalToken}}" }],
-            "url": { "raw": "{{baseUrl}}/content/admin/pending", "host": ["{{baseUrl}}"], "path": ["content", "admin", "pending"] }
-          }
-        },
-        {
-          "name": "View All System Content",
-          "request": {
-            "method": "GET",
-            "header": [{ "key": "Authorization", "value": "Bearer {{principalToken}}" }],
+            "header": [
+              { "key": "Authorization", "value": "Bearer {{principalToken}}" }
+            ],
             "url": {
-              "raw": "{{baseUrl}}/content/admin/all?status=APPROVED",
+              "raw": "{{baseUrl}}/content/admin/pending?limit=20",
               "host": ["{{baseUrl}}"],
-              "path": ["content", "admin", "all"],
-              "query": [{ "key": "status", "value": "APPROVED" }]
+              "path": ["content", "admin", "pending"],
+              "query": [
+                { "key": "limit", "value": "20" }
+              ]
             }
           }
         },
         {
           "name": "Approve Content",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "const response = pm.response.json();",
+                  "console.log('Approve Response:', response);",
+                  "",
+                  "if (response.success) {",
+                  "    console.log('✅ Content approved successfully!');",
+                  "    console.log('   Title:', response.data.title);",
+                  "    console.log('   Status:', response.data.status);",
+                  "    console.log('   Approved At:', response.data.approvedAt);",
+                  "    console.log('👉 Next: Test Live Feed endpoint');",
+                  "} else {",
+                  "    console.log('❌ Approval failed:', response.error?.message);",
+                  "}"
+                ],
+                "type": "text/javascript"
+              }
+            }
+          ],
           "request": {
             "method": "POST",
-            "header": [{ "key": "Authorization", "value": "Bearer {{principalToken}}" }],
-            "url": { "raw": "{{baseUrl}}/content/admin/{{contentId}}/approve", "host": ["{{baseUrl}}"], "path": ["content", "admin", "{{contentId}}", "approve"] }
+            "header": [
+              { "key": "Authorization", "value": "Bearer {{principalToken}}" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": ""
+            },
+            "url": {
+              "raw": "{{baseUrl}}/content/admin/{{contentId}}/approve",
+              "host": ["{{baseUrl}}"],
+              "path": ["content", "admin", "{{contentId}}", "approve"]
+            }
           }
         },
         {
           "name": "Reject Content",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "const response = pm.response.json();",
+                  "if (response.success) {",
+                  "    console.log('✅ Content rejected');",
+                  "    console.log('   Status:', response.data.status);",
+                  "    console.log('   Reason:', response.data.rejectionReason);",
+                  "}"
+                ],
+                "type": "text/javascript"
+              }
+            }
+          ],
           "request": {
             "method": "POST",
             "header": [
               { "key": "Authorization", "value": "Bearer {{principalToken}}" },
               { "key": "Content-Type", "value": "application/json" }
             ],
-            "url": { "raw": "{{baseUrl}}/content/admin/{{contentId}}/reject", "host": ["{{baseUrl}}"], "path": ["content", "admin", "{{contentId}}", "reject"] },
             "body": {
               "mode": "raw",
-              "raw": "{\n  \"reason\": \"Image quality is too low for broadcasting.\"\n}"
+              "raw": "{\n  \"reason\": \"Image quality is too low. Please resubmit with higher resolution.\"\n}"
+            },
+            "url": {
+              "raw": "{{baseUrl}}/content/admin/{{contentId}}/reject",
+              "host": ["{{baseUrl}}"],
+              "path": ["content", "admin", "{{contentId}}", "reject"]
+            }
+          }
+        },
+        {
+          "name": "View All Content (Admin)",
+          "request": {
+            "method": "GET",
+            "header": [
+              { "key": "Authorization", "value": "Bearer {{principalToken}}" }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/content/admin/all?status=APPROVED&limit=20",
+              "host": ["{{baseUrl}}"],
+              "path": ["content", "admin", "all"],
+              "query": [
+                { "key": "status", "value": "APPROVED" },
+                { "key": "limit", "value": "20" }
+              ]
             }
           }
         }
       ]
     },
     {
-      "name": "04. Public Broadcasting",
+      "name": "05. Public - Broadcasting",
       "item": [
         {
-          "name": "Live Feed (Teacher Specific)",
+          "name": "Get Live Content (All Subjects)",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "const response = pm.response.json();",
+                  "console.log('Live Content:', response.data);",
+                  "",
+                  "if (response.data?.content) {",
+                  "    console.log('✅ Content is live!');",
+                  "    console.log('   Title:', response.data.content.title);",
+                  "    console.log('   Subject:', response.data.content.subject);",
+                  "    console.log('   Active Until:', response.data.content.activeUntil);",
+                  "    console.log('   Cached:', response.cached);",
+                  "    if (response.data.content.rotationInfo) {",
+                  "        console.log('   Rotation Info:');",
+                  "        console.log('     - Total Content in Rotation:', response.data.content.rotationInfo.totalContents);",
+                  "        console.log('     - Current Index:', response.data.content.rotationInfo.currentIndex);",
+                  "        console.log('     - Time Remaining:', response.data.content.rotationInfo.remainingSeconds, 'seconds');",
+                  "    }",
+                  "} else {",
+                  "    console.log('ℹ️ No content available:', response.data?.message);",
+                  "}"
+                ],
+                "type": "text/javascript"
+              }
+            }
+          ],
           "request": {
             "method": "GET",
-            "url": { "raw": "{{baseUrl}}/content/live/{{teacherId}}", "host": ["{{baseUrl}}"], "path": ["content", "live", "{{teacherId}}"] }
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/content/live/{{teacherId}}",
+              "host": ["{{baseUrl}}"],
+              "path": ["content", "live", "{{teacherId}}"]
+            }
           }
         },
         {
-          "name": "Live Feed with Subject Filter",
+          "name": "Get Live Content (Math Only)",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "const response = pm.response.json();",
+                  "if (response.data?.content) {",
+                  "    console.log('✅ Math content is live:', response.data.content.title);",
+                  "} else {",
+                  "    console.log('ℹ️ No math content available');",
+                  "}"
+                ],
+                "type": "text/javascript"
+              }
+            }
+          ],
           "request": {
             "method": "GET",
+            "header": [],
             "url": {
               "raw": "{{baseUrl}}/content/live/{{teacherId}}?subject=maths",
               "host": ["{{baseUrl}}"],
               "path": ["content", "live", "{{teacherId}}"],
-              "query": [{ "key": "subject", "value": "maths" }]
+              "query": [
+                { "key": "subject", "value": "maths" }
+              ]
+            }
+          }
+        },
+        {
+          "name": "Get Live Content (Invalid Subject - Edge Case)",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "const response = pm.response.json();",
+                  "console.log('Response:', response);",
+                  "",
+                  "if (response.success && !response.data?.content) {",
+                  "    console.log('✅ Edge case handled correctly');",
+                  "    console.log('   Returns 200 OK with null content (not an error)');",
+                  "    console.log('   Message:', response.data?.message);",
+                  "} else {",
+                  "    console.log('❌ Edge case NOT handled correctly');",
+                  "}"
+                ],
+                "type": "text/javascript"
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/content/live/{{teacherId}}?subject=invalid_subject",
+              "host": ["{{baseUrl}}"],
+              "path": ["content", "live", "{{teacherId}}"],
+              "query": [
+                { "key": "subject", "value": "invalid_subject" }
+              ]
             }
           }
         }
       ]
     },
     {
-      "name": "05. User Module",
+      "name": "06. User Management",
       "item": [
         {
           "name": "Get My Profile",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "const response = pm.response.json();",
+                  "if (response.success) {",
+                  "    console.log('✅ Profile retrieved');",
+                  "    console.log('   Name:', response.data.name);",
+                  "    console.log('   Email:', response.data.email);",
+                  "    console.log('   Role:', response.data.role);",
+                  "}"
+                ],
+                "type": "text/javascript"
+              }
+            }
+          ],
           "request": {
             "method": "GET",
-            "header": [{ "key": "Authorization", "value": "Bearer {{teacherToken}}" }],
-            "url": { "raw": "{{baseUrl}}/users/me", "host": ["{{baseUrl}}"], "path": ["users", "me"] }
+            "header": [
+              { "key": "Authorization", "value": "Bearer {{teacherToken}}" }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/users/me",
+              "host": ["{{baseUrl}}"],
+              "path": ["users", "me"]
+            }
           }
         },
         {
           "name": "List All Teachers",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "const response = pm.response.json();",
+                  "if (response.data?.length > 0) {",
+                  "    console.log('✅ Found', response.data.length, 'teachers');",
+                  "    response.data.forEach((teacher, i) => {",
+                  "        console.log(`  ${i+1}. ${teacher.name} (${teacher.email})`);",
+                  "    });",
+                  "}"
+                ],
+                "type": "text/javascript"
+              }
+            }
+          ],
           "request": {
             "method": "GET",
-            "header": [{ "key": "Authorization", "value": "Bearer {{principalToken}}" }],
-            "url": { "raw": "{{baseUrl}}/users/teachers", "host": ["{{baseUrl}}"], "path": ["users", "teachers"] }
+            "header": [
+              { "key": "Authorization", "value": "Bearer {{principalToken}}" }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/users/teachers",
+              "host": ["{{baseUrl}}"],
+              "path": ["users", "teachers"]
+            }
           }
         }
       ]
     },
     {
-      "name": "06. Analytics Module",
+      "name": "07. Analytics",
       "item": [
         {
-          "name": "System Stats (Principal Only)",
+          "name": "Get System Stats (Principal Only)",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "const response = pm.response.json();",
+                  "if (response.success) {",
+                  "    console.log('✅ Analytics retrieved');",
+                  "    console.log('By Subject:', response.data.bySubject);",
+                  "    console.log('Top Content:', response.data.topContent);",
+                  "}"
+                ],
+                "type": "text/javascript"
+              }
+            }
+          ],
           "request": {
             "method": "GET",
-            "header": [{ "key": "Authorization", "value": "Bearer {{principalToken}}" }],
-            "url": { "raw": "{{baseUrl}}/analytics/system", "host": ["{{baseUrl}}"], "path": ["analytics", "system"] }
+            "header": [
+              { "key": "Authorization", "value": "Bearer {{principalToken}}" }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/analytics/system",
+              "host": ["{{baseUrl}}"],
+              "path": ["analytics", "system"]
+            }
+          }
+        }
+      ]
+    },
+    {
+      "name": "08. Edge Cases & Error Handling",
+      "item": [
+        {
+          "name": "Test - Upload Without File (Should Fail)",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "const response = pm.response.json();",
+                  "if (!response.success) {",
+                  "    console.log('✅ Correctly rejected upload without file');",
+                  "    console.log('   Error:', response.error?.message);",
+                  "} else {",
+                  "    console.log('❌ Should have rejected upload');",
+                  "}"
+                ],
+                "type": "text/javascript"
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Authorization", "value": "Bearer {{teacherToken}}" }
+            ],
+            "body": {
+              "mode": "formdata",
+              "formdata": [
+                { "key": "title", "value": "Test", "type": "text" },
+                { "key": "subject", "value": "maths", "type": "text" }
+              ]
+            },
+            "url": {
+              "raw": "{{baseUrl}}/content/upload",
+              "host": ["{{baseUrl}}"],
+              "path": ["content", "upload"]
+            }
+          }
+        },
+        {
+          "name": "Test - Invalid Subject Upload (Should Fail)",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "const response = pm.response.json();",
+                  "if (!response.success) {",
+                  "    console.log('✅ Correctly rejected invalid subject');",
+                  "    console.log('   Error:', response.error?.message);",
+                  "} else {",
+                  "    console.log('❌ Should have rejected invalid subject');",
+                  "}"
+                ],
+                "type": "text/javascript"
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Authorization", "value": "Bearer {{teacherToken}}" }
+            ],
+            "body": {
+              "mode": "formdata",
+              "formdata": [
+                { "key": "title", "value": "Test", "type": "text" },
+                { "key": "subject", "value": "invalid_subject", "type": "text" },
+                { "key": "file", "type": "file", "src": [] },
+                { "key": "startTime", "value": "2026-04-26T10:00:00Z", "type": "text" },
+                { "key": "endTime", "value": "2026-04-26T18:00:00Z", "type": "text" }
+              ]
+            },
+            "url": {
+              "raw": "{{baseUrl}}/content/upload",
+              "host": ["{{baseUrl}}"],
+              "path": ["content", "upload"]
+            }
+          }
+        },
+        {
+          "name": "Test - No Auth Token (Should Fail)",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "const response = pm.response.json();",
+                  "if (!response.success && pm.response.code === 401) {",
+                  "    console.log('✅ Correctly rejected request without token');",
+                  "    console.log('   Status:', pm.response.code);",
+                  "} else {",
+                  "    console.log('❌ Should have rejected without token');",
+                  "}"
+                ],
+                "type": "text/javascript"
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/content/my-uploads",
+              "host": ["{{baseUrl}}"],
+              "path": ["content", "my-uploads"]
+            }
+          }
+        },
+        {
+          "name": "Test - Teacher Cannot Approve (Should Fail)",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "const response = pm.response.json();",
+                  "if (!response.success && pm.response.code === 403) {",
+                  "    console.log('✅ Correctly blocked teacher from approving');",
+                  "    console.log('   Error:', response.error?.message);",
+                  "} else {",
+                  "    console.log('❌ Should have blocked teacher');",
+                  "}"
+                ],
+                "type": "text/javascript"
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Authorization", "value": "Bearer {{teacherToken}}" }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/content/admin/{{contentId}}/approve",
+              "host": ["{{baseUrl}}"],
+              "path": ["content", "admin", "{{contentId}}", "approve"]
+            }
+          }
+        }
+      ]
+    },
+    {
+      "name": "09. DEMO WORKFLOW (Run in Order)",
+      "item": [
+        {
+          "name": "1. Setup - Register Accounts",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"name\": \"Demo Teacher\",\n  \"email\": \"demo.teacher.{{$timestamp}}@school.com\",\n  \"password\": \"DemoPass123!\",\n  \"role\": \"TEACHER\"\n}"
+            },
+            "url": {
+              "raw": "{{baseUrl}}/auth/register",
+              "host": ["{{baseUrl}}"],
+              "path": ["auth", "register"]
+            }
+          }
+        },
+        {
+          "name": "2. Teacher - Upload Content",
+          "event": [
+            {
+              "listen": "prerequest",
+              "script": {
+                "exec": [
+                  "const now = new Date();",
+                  "const startTime = now.toISOString();",
+                  "const endTime = new Date(now.getTime() + 8 * 3600 * 1000).toISOString();",
+                  "pm.collectionVariables.set('startTime', startTime);",
+                  "pm.collectionVariables.set('endTime', endTime);"
+                ],
+                "type": "text/javascript"
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Authorization", "value": "Bearer {{teacherToken}}" },
+              { "key": "Idempotency-Key", "value": "{{$guid}}" }
+            ],
+            "body": {
+              "mode": "formdata",
+              "formdata": [
+                { "key": "title", "value": "Demo Content - Physics Experiment", "type": "text" },
+                { "key": "subject", "value": "science", "type": "text" },
+                { "key": "description", "value": "Demonstrating Newton's Laws of Motion", "type": "text" },
+                { "key": "file", "type": "file", "src": [] },
+                { "key": "startTime", "value": "{{startTime}}", "type": "text" },
+                { "key": "endTime", "value": "{{endTime}}", "type": "text" }
+              ]
+            },
+            "url": {
+              "raw": "{{baseUrl}}/content/upload",
+              "host": ["{{baseUrl}}"],
+              "path": ["content", "upload"]
+            }
+          }
+        },
+        {
+          "name": "3. Principal - Review Pending",
+          "request": {
+            "method": "GET",
+            "header": [
+              { "key": "Authorization", "value": "Bearer {{principalToken}}" }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/content/admin/pending",
+              "host": ["{{baseUrl}}"],
+              "path": ["content", "admin", "pending"]
+            }
+          }
+        },
+        {
+          "name": "4. Principal - Approve Content",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Authorization", "value": "Bearer {{principalToken}}" }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/content/admin/{{contentId}}/approve",
+              "host": ["{{baseUrl}}"],
+              "path": ["content", "admin", "{{contentId}}", "approve"]
+            }
+          }
+        },
+        {
+          "name": "5. Student - Access Live Content",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/content/live/{{teacherId}}?subject=science",
+              "host": ["{{baseUrl}}"],
+              "path": ["content", "live", "{{teacherId}}"],
+              "query": [
+                { "key": "subject", "value": "science" }
+              ]
+            }
           }
         }
       ]
