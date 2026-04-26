@@ -6,6 +6,100 @@ datasource db {
   provider = "postgresql"
 }
 
+model User {
+  id            String     @id @default(uuid())
+  name          String     @default("User")
+  email         String     @unique
+  password_hash String
+  role          Role       @default(TEACHER)
+  createdAt     DateTime   @default(now())
+  updatedAt     DateTime   @updatedAt
+  auditLogs     AuditLog[]
+  approved      Content[]  @relation("ApprovedContent")
+  content       Content[]  @relation("UploadedContent")
+}
+
+model Content {
+  id              String           @id @default(uuid())
+  title           String
+  description     String?
+  subject         String
+  fileUrl         String           @map("file_path")
+  fileType        String           @default("jpg") @map("file_type")
+  fileSize        Int              @default(0) @map("file_size")
+  status          Status           @default(PENDING)
+  rejectionReason String?          @map("rejection_reason")
+  teacherId       String           @map("uploaded_by")
+  approvedById    String?          @map("approved_by")
+  approvedAt      DateTime?        @map("approved_at")
+  createdAt       DateTime         @default(now()) @map("created_at")
+  updatedAt       DateTime         @updatedAt @map("updated_at")
+  approvedBy      User?            @relation("ApprovedContent", fields: [approvedById], references: [id])
+  author          User             @relation("UploadedContent", fields: [teacherId], references: [id])
+  schedule        ContentSchedule?
+  slots           ContentSlot[]
+
+  @@index([subject, status])
+  @@index([status, createdAt(sort: Desc)])
+}
+
+model ContentSchedule {
+  id                      String       @id @default(uuid())
+  contentId               String       @unique @map("content_id")
+  slotId                  String?      @map("slot_id")
+  startTime               DateTime     @map("start_time")
+  endTime                 DateTime     @map("end_time")
+  rotationDurationMinutes Int          @default(5) @map("rotation_duration_minutes")
+  createdAt               DateTime     @default(now()) @map("created_at")
+  updatedAt               DateTime     @updatedAt @map("updated_at")
+  content                 Content      @relation(fields: [contentId], references: [id], onDelete: Cascade)
+  slot                    ContentSlot? @relation("ScheduleSlot", fields: [slotId], references: [id])
+
+  @@index([startTime, endTime])
+}
+
+model ContentSlot {
+  id            String            @id @default(uuid())
+  subject       String
+  rotationOrder Int               @map("rotation_order")
+  contentId     String            @map("content_id")
+  createdAt     DateTime          @default(now()) @map("created_at")
+  updatedAt     DateTime          @updatedAt @map("updated_at")
+  schedules     ContentSchedule[] @relation("ScheduleSlot")
+  content       Content           @relation(fields: [contentId], references: [id], onDelete: Cascade)
+
+  @@unique([subject, rotationOrder], name: "idx_subject_rotation_order")
+  @@index([subject])
+}
+
+model AuditLog {
+  id         String   @id @default(uuid())
+  userId     String?  @map("user_id")
+  action     String
+  entityType String   @map("entity_type")
+  entityId   String?  @map("entity_id")
+  changes    Json?
+  timestamp  DateTime @default(now())
+  user       User?    @relation(fields: [userId], references: [id])
+
+  @@index([userId])
+  @@index([entityType, entityId])
+}
+
+model Analytics {
+  id        String   @id @default(uuid())
+  contentId String   @map("content_id")
+  teacherId String   @map("teacher_id")
+  subject   String
+  viewCount Int      @default(1) @map("view_count")
+  date      DateTime @default(now())
+
+  @@unique([contentId, date], name: "idx_content_date")
+  @@index([subject])
+  @@index([teacherId])
+  @@index([date])
+}
+
 enum Role {
   PRINCIPAL
   TEACHER
@@ -16,107 +110,4 @@ enum Status {
   PENDING
   APPROVED
   REJECTED
-}
-
-model User {
-  id            String    @id @default(uuid())
-  name          String    @default("User")
-  email         String    @unique
-  password_hash String
-  role          Role      @default(TEACHER)
-  content       Content[] @relation("UploadedContent")
-  approved      Content[] @relation("ApprovedContent")
-  auditLogs     AuditLog[]
-  createdAt     DateTime  @default(now())
-  updatedAt     DateTime  @updatedAt
-}
-
-model Content {
-  id               String           @id @default(uuid())
-  title            String
-  description      String?
-  subject          String   
-  fileUrl          String           @map("file_path")
-  fileType         String           @map("file_type") @default("jpg")
-  fileSize         Int              @map("file_size") @default(0)
-  status           Status           @default(PENDING)
-  rejectionReason  String?          @map("rejection_reason")
-  
-  teacherId        String           @map("uploaded_by")
-  author           User             @relation("UploadedContent", fields: [teacherId], references: [id])
-  
-  approvedById     String?          @map("approved_by")
-  approvedBy       User?            @relation("ApprovedContent", fields: [approvedById], references: [id])
-  approvedAt       DateTime?        @map("approved_at")
-  
-  schedule         ContentSchedule?
-  slots            ContentSlot[]
-  
-  createdAt        DateTime         @default(now()) @map("created_at")
-  updatedAt        DateTime         @updatedAt @map("updated_at")
-
-  @@index([subject, status])
-  @@index([status, createdAt(sort: Desc)])
-}
-
-model ContentSchedule {
-  id                      String       @id @default(uuid())
-  contentId               String       @unique @map("content_id")
-  content                 Content      @relation(fields: [contentId], references: [id], onDelete: Cascade)
-  
-  // Link to the ContentSlot this schedule belongs to (spec requirement)
-  slotId                  String?      @map("slot_id")
-  slot                    ContentSlot? @relation("ScheduleSlot", fields: [slotId], references: [id], onDelete: SetNull)
-
-  startTime               DateTime     @map("start_time")
-  endTime                 DateTime     @map("end_time")
-  rotationDurationMinutes Int          @default(5) @map("rotation_duration_minutes")
-  
-  createdAt               DateTime     @default(now()) @map("created_at")
-  updatedAt               DateTime     @updatedAt @map("updated_at")
-  
-  @@index([startTime, endTime])
-}
-
-model ContentSlot {
-  id              String            @id @default(uuid())
-  subject         String
-  rotationOrder   Int               @map("rotation_order")
-  contentId       String            @map("content_id")
-  content         Content           @relation(fields: [contentId], references: [id], onDelete: Cascade)
-  schedules       ContentSchedule[] @relation("ScheduleSlot")
-  
-  createdAt       DateTime @default(now()) @map("created_at")
-  updatedAt       DateTime @updatedAt @map("updated_at")
-
-  @@unique([subject, rotationOrder], name: "idx_subject_rotation_order")
-  @@index([subject])
-}
-
-model AuditLog {
-  id          String   @id @default(uuid())
-  userId      String?  @map("user_id")
-  user        User?    @relation(fields: [userId], references: [id])
-  action      String
-  entityType  String   @map("entity_type")
-  entityId    String?  @map("entity_id")
-  changes     Json?
-  timestamp   DateTime @default(now())
-
-  @@index([userId])
-  @@index([entityType, entityId])
-}
-
-model Analytics {
-  id          String   @id @default(uuid())
-  contentId   String   @map("content_id")
-  teacherId   String   @map("teacher_id")
-  subject     String
-  viewCount   Int      @default(1) @map("view_count")
-  date        DateTime @default(now())
-
-  @@unique([contentId, date], name: "idx_content_date")
-  @@index([subject])
-  @@index([teacherId])
-  @@index([date])
 }

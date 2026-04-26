@@ -25,7 +25,7 @@ app.use(idempotencyGuard);
 app.use('/api', apiLimiter);
 
 // Health check
-app.get('/health', (req, res) => {
+app.get('/health', (req: express.Request, res: express.Response) => {
     res.status(200).json({ status: 'ok' });
 });
 
