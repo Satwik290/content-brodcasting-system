@@ -10,6 +10,7 @@ router.get('/my-uploads', authenticate, roleGuard(['TEACHER', 'PRINCIPAL']), Con
 
 // Admin endpoints
 router.get('/admin/pending', authenticate, roleGuard(['PRINCIPAL']), ContentController.getPendingContent);
+router.get('/admin/all', authenticate, roleGuard(['PRINCIPAL']), ContentController.listAllContent);
 router.post('/admin/:id/approve', authenticate, roleGuard(['PRINCIPAL']), ContentController.approve);
 router.post('/admin/:id/reject', authenticate, roleGuard(['PRINCIPAL']), ContentController.reject);
 

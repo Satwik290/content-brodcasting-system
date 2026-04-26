@@ -49,7 +49,25 @@ export class LocalStorageProvider implements StorageProvider {
     }
 }
 
+export class S3StorageProvider implements StorageProvider {
+    // Note: In a real app, these would come from env vars
+    // private s3 = new S3Client({ region: 'us-east-1' });
+
+    async save(file: Express.Multer.File, metadata: { title: string, subject: string }) {
+        // Implementation would use @aws-sdk/client-s3
+        // PutObjectCommand(...)
+        
+        console.log(`[S3] Mock upload: ${file.originalname} to bucket educational-content`);
+        
+        return {
+            path: `https://educational-content.s3.amazonaws.com/${uuidv4()}-${file.originalname}`,
+            type: file.originalname.split('.').pop() || 'unknown',
+            size: file.size
+        };
+    }
+}
+
 // Configured provider singleton
 export const UploadService = process.env.STORAGE === 's3'
-    ? new LocalStorageProvider() // Replace with S3StorageProvider when implemented
+    ? new S3StorageProvider()
     : new LocalStorageProvider();

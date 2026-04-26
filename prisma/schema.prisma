@@ -12,6 +12,7 @@ enum Role {
 }
 
 enum Status {
+  UPLOADED
   PENDING
   APPROVED
   REJECTED
@@ -54,36 +55,42 @@ model Content {
   createdAt        DateTime         @default(now()) @map("created_at")
   updatedAt        DateTime         @updatedAt @map("updated_at")
 
-  @@index([subject])
+  @@index([subject, status])
   @@index([status, createdAt(sort: Desc)])
 }
 
 model ContentSchedule {
-  id                      String   @id @default(uuid())
-  contentId               String   @unique @map("content_id")
-  content                 Content  @relation(fields: [contentId], references: [id], onDelete: Cascade)
+  id                      String       @id @default(uuid())
+  contentId               String       @unique @map("content_id")
+  content                 Content      @relation(fields: [contentId], references: [id], onDelete: Cascade)
   
-  startTime               DateTime @map("start_time")
-  endTime                 DateTime @map("end_time")
-  rotationDurationMinutes Int      @default(5) @map("rotation_duration_minutes")
+  // Link to the ContentSlot this schedule belongs to (spec requirement)
+  slotId                  String?      @map("slot_id")
+  slot                    ContentSlot? @relation("ScheduleSlot", fields: [slotId], references: [id], onDelete: SetNull)
+
+  startTime               DateTime     @map("start_time")
+  endTime                 DateTime     @map("end_time")
+  rotationDurationMinutes Int          @default(5) @map("rotation_duration_minutes")
   
-  createdAt               DateTime @default(now())
-  updatedAt               DateTime @updatedAt
+  createdAt               DateTime     @default(now()) @map("created_at")
+  updatedAt               DateTime     @updatedAt @map("updated_at")
   
   @@index([startTime, endTime])
 }
 
 model ContentSlot {
-  id              String   @id @default(uuid())
+  id              String            @id @default(uuid())
   subject         String
-  rotationOrder   Int      @map("rotation_order")
-  contentId       String   @map("content_id")
-  content         Content  @relation(fields: [contentId], references: [id], onDelete: Cascade)
+  rotationOrder   Int               @map("rotation_order")
+  contentId       String            @map("content_id")
+  content         Content           @relation(fields: [contentId], references: [id], onDelete: Cascade)
+  schedules       ContentSchedule[] @relation("ScheduleSlot")
   
   createdAt       DateTime @default(now()) @map("created_at")
   updatedAt       DateTime @updatedAt @map("updated_at")
 
-  @@index([subject, rotationOrder])
+  @@unique([subject, rotationOrder], name: "idx_subject_rotation_order")
+  @@index([subject])
 }
 
 model AuditLog {
@@ -98,4 +105,18 @@ model AuditLog {
 
   @@index([userId])
   @@index([entityType, entityId])
+}
+
+model Analytics {
+  id          String   @id @default(uuid())
+  contentId   String   @map("content_id")
+  teacherId   String   @map("teacher_id")
+  subject     String
+  viewCount   Int      @default(1) @map("view_count")
+  date        DateTime @default(now())
+
+  @@unique([contentId, date], name: "idx_content_date")
+  @@index([subject])
+  @@index([teacherId])
+  @@index([date])
 }

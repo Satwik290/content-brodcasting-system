@@ -119,8 +119,8 @@ ALTER TABLE "AuditLog" ADD CONSTRAINT "AuditLog_user_id_fkey" FOREIGN KEY ("user
 CREATE OR REPLACE FUNCTION prevent_approved_modification()
 RETURNS TRIGGER AS $$
 BEGIN
-  IF OLD.status = 'APPROVED' AND NEW.status = 'APPROVED' THEN
-    RAISE EXCEPTION 'Cannot modify approved content';
+  IF OLD.status = 'APPROVED' THEN
+    RAISE EXCEPTION 'Immutable: Cannot modify approved content (id=%)', OLD.id;
   END IF;
   RETURN NEW;
 END;

@@ -27,28 +27,67 @@ async function processAnalytics() {
 
             if (response) {
                 const messages = response[0][1];
-                const contentHits: Record<string, number> = {};
+                // Bulk Upsert to DB
+                // We aggregate views per contentId for the current date to minimize DB writes
+                const today = new Date();
+                today.setHours(0, 0, 0, 0);
+
+                const aggregation: Record<string, { contentId: string, teacherId: string, subject: string, count: number }> = {};
                 const messageIds: string[] = [];
 
-                // Probabilistic sampling / Aggregation
                 for (const [id, fields] of messages) {
                     messageIds.push(id);
-                    const contentId = fields[1]; // assuming fields = ['content_id', 'UUID', 'timestamp', '123']
-                    
-                    if (!contentHits[contentId]) contentHits[contentId] = 0;
-                    contentHits[contentId]++;
+                    // Fields are key-value pairs in the array: ['content_id', 'UUID', 'teacher_id', 'UUID', 'subject', 'maths', 'timestamp', '...']
+                    // ioredis returns them as flat array [key, val, key, val...]
+                    const data: Record<string, string> = {};
+                    for (let i = 0; i < fields.length; i += 2) {
+                        data[fields[i]] = fields[i+1];
+                    }
+
+                    const key = data.content_id;
+                    if (!aggregation[key]) {
+                        aggregation[key] = {
+                            contentId: data.content_id,
+                            teacherId: data.teacher_id,
+                            subject: data.subject,
+                            count: 0
+                        };
+                    }
+                    aggregation[key].count++;
                 }
 
-                // Upsert to DB
-                // For a robust system we could increment a viewCount on Content or a separate Analytics table.
-                // Assuming we just log that we processed them successfully to the console for this demo since Analytics table isn't in PRD schema.
-                console.log(`[Worker] Processed ${messageIds.length} views. Upserting to DB...`, contentHits);
-                // Mocking the Bulk Upsert
-                // await prisma.analytics.upsert(...)
-                
-                // ONLY ACK messages AFTER successful DB write
-                if (messageIds.length > 0) {
-                    await redis.xack(STREAM_KEY, CONSUMER_GROUP, ...messageIds);
+                // Perform Upserts
+                try {
+                    await Promise.all(Object.values(aggregation).map(item => 
+                        (prisma as any).analytics.upsert({
+                            where: {
+                                idx_content_date: {
+                                    contentId: item.contentId,
+                                    date: today
+                                }
+                            },
+                            update: {
+                                viewCount: { increment: item.count }
+                            },
+                            create: {
+                                contentId: item.contentId,
+                                teacherId: item.teacherId,
+                                subject: item.subject,
+                                viewCount: item.count,
+                                date: today
+                            }
+                        })
+                    ));
+
+                    console.log(`[Worker] Successfully aggregated and saved ${messageIds.length} views.`);
+
+                    // ONLY ACK messages AFTER successful DB write
+                    if (messageIds.length > 0) {
+                        await redis.xack(STREAM_KEY, CONSUMER_GROUP, ...messageIds);
+                    }
+                } catch (dbErr) {
+                    console.error('[Worker] DB Upsert Error:', dbErr);
+                    // Messages will remain in PEL (Pending Entry List) for retry
                 }
             }
         }
