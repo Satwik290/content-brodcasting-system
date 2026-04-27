@@ -11,7 +11,7 @@ const server = app.listen(PORT, () => {
 // Global Process Handlers for Resilience
 process.on('unhandledRejection', (reason, promise) => {
     logger.error('Unhandled Rejection at:', promise, 'reason:', reason);
-    // Graceful shutdown recommended in prod
+
 });
 
 process.on('uncaughtException', (error) => {

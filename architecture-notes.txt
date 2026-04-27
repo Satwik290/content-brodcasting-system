@@ -1,278 +1,1836 @@
-=========================================
-ARCHITECTURE NOTES: CONTENT BROADCASTING
-=========================================
+================================================================================
+                    CONTENT BROADCASTING SYSTEM
+                        ARCHITECTURE NOTES
+================================================================================
 
+TABLE OF CONTENTS
+================================================================================
 1. Authentication & RBAC Flow
-----------------------------------------------
-All protected routes require a JWT Bearer token sent in the Authorization header.
-
-Flow:
-  Client --> POST /api/v1/auth/login --> AuthController
-          --> bcrypt.compare(password, hash)
-          --> jwt.sign({ id, role }, JWT_SECRET, { expiresIn: '1h' })
-          --> Returns token
-
-Protected Request Flow:
-  Client --> [Any Protected Route] --> authenticate() middleware
-          --> jwt.verify(token, JWT_SECRET)
-          --> Attaches { id, role } to req.user
-          --> roleGuard(['PRINCIPAL']) or roleGuard(['TEACHER']) middleware
-          --> Checks req.user.role against allowed roles
-          --> Passes or returns 403 Forbidden
-
-Roles:
-  - TEACHER: Can upload content, view their own uploads
-  - PRINCIPAL: Can view pending content, approve, reject
-
-Key Files:
-  - src/middlewares/auth.ts       (authenticate, roleGuard)
-  - src/controllers/auth.controller.ts
-  - src/validators/auth.validator.ts
-
 2. Subject-Based System Design
-----------------------------------------------
-Each piece of content is tagged with a subject (maths, science, english, etc.).
-The broadcasting engine filters and rotates content strictly per-subject per-teacher.
-
-Content is linked to both a ContentSchedule (time window + duration) and a
-ContentSlot (rotation order within a subject). This ensures that:
-
-  - Subject A (Maths) has its own independent rotation queue
-  - Subject B (Science) has its own independent rotation queue
-  - No subject's rotation bleeds into another
-
-When a student calls GET /content/live/teacher-1?subject=maths, only Maths content
-for that teacher participates in the rotation calculation.
-
-Key Files:
-  - src/services/scheduling.service.ts
-  - src/services/content.service.ts
-  - prisma/schema.prisma (ContentSlot, ContentSchedule models)
-
 3. Upload Handling Approach
+4. Approval Workflow Design
+5. Scheduling/Rotation Logic (CORE ALGORITHM)
+6. Database Design Decisions
+7. Folder Structure & Organization
+8. Middleware Stack & Request Pipeline
+9. Scalability Approach (Caching, Queues, Performance)
+10. Deployment & Operations
+
+================================================================================
+1. AUTHENTICATION & RBAC FLOW
+================================================================================
+
+OVERVIEW
+--------
+The system uses JWT (JSON Web Tokens) with bcrypt password hashing and 
+role-based access control (RBAC). Two roles exist:
+  - TEACHER: Can upload content, view own uploads
+  - PRINCIPAL: Can approve/reject content, view all content, analytics
+
+JWT AUTHENTICATION FLOW
+-----------------------
+
+Step 1: Registration/Login
+  Client POST /api/v1/auth/register OR /api/v1/auth/login
+         with { email, password, role }
+
+  Server:
+    ├─ Lookup user by email in database
+    ├─ Verify password using bcrypt.compare()
+    ├─ If valid:
+    │   └─ Generate JWT: jwt.sign({ id, role }, JWT_SECRET, { expiresIn: '1h' })
+    └─ Return { token, role, user }
+
+Step 2: Protected Request
+  Client sends Authorization header: "Bearer <jwt-token>"
+
+  Server middleware (src/middlewares/auth.ts):
+    ├─ Extract token from Authorization header
+    ├─ Verify signature: jwt.verify(token, JWT_SECRET)
+    ├─ Check Redis blocklist (for logout): redis.get(`blocklist:${token}`)
+    ├─ If token is revoked: return 401 Unauthorized
+    ├─ If valid: Decode and attach req.user = { id, role } to request
+    └─ Pass to next middleware
+
+Step 3: Role Guard
+  Server middleware (roleGuard):
+    ├─ Check if req.user.role is in allowedRoles array
+    ├─ If yes: Grant access
+    └─ If no: Return 403 Forbidden
+
+Step 4: Logout (Token Blocklist)
+  Client POST /api/v1/auth/logout with Authorization header
+
+  Server:
+    ├─ Decode JWT (without verifying) to get exp (expiry timestamp)
+    ├─ Calculate remainingTime = exp - now
+    ├─ If remainingTime > 0:
+    │   └─ redis.setex(`blocklist:${token}`, remainingTime, '1')
+    │       (Token is blocklisted for exactly its remaining lifetime)
+    └─ Return { success: true }
+
+  On subsequent requests with that token:
+    ├─ Token middleware checks redis.get(`blocklist:${token}`)
+    ├─ If found: return 401 Token has been revoked
+    └─ Else: proceed normally
+
+JWT SECRET MANAGEMENT
+---------------------
+Default: 'supersecretjwtkey' (in development)
+Production: Must be set via environment variable JWT_SECRET
+
+Token Expiry: 1 hour (can be increased if needed)
+  - Shorter expiry = better security
+  - Longer expiry = fewer login prompts needed
+
+RBAC MATRIX
+-----------
+Endpoint                              | TEACHER | PRINCIPAL | Notes
+-------------------------------------|---------|-----------|--------------------
+POST /auth/register                  |   ✅    |    ✅     | Anyone can register
+POST /auth/login                     |   ✅    |    ✅     | Anyone can login
+POST /auth/logout                    |   ✅    |    ✅     | Authenticated only
+
+POST /content/upload                 |   ✅    |    ✅     | TEACHER/PRINCIPAL
+GET  /content/my-uploads             |   ✅    |    ✅     | Own uploads only
+GET  /content/admin/pending          |   ❌    |    ✅     | PRINCIPAL only
+GET  /content/admin/all              |   ❌    |    ✅     | PRINCIPAL only
+POST /content/admin/:id/approve      |   ❌    |    ✅     | PRINCIPAL only
+POST /content/admin/:id/reject       |   ❌    |    ✅     | PRINCIPAL only
+
+GET  /content/live/:teacherId        |   ✅    |    ✅     | Public (no auth)
+GET  /users/me                       |   ✅    |    ✅     | Authenticated
+GET  /users/teachers                 |   ✅    |    ✅     | PRINCIPAL can list all
+GET  /analytics/system               |   ❌    |    ✅     | PRINCIPAL only
+
+KEY FILES
+---------
+src/middlewares/auth.ts              ← authenticate() and roleGuard()
+src/controllers/auth.controller.ts   ← login, register, logout handlers
+src/services/auth.service.ts         ← bcrypt, JWT token generation
+src/validators/auth.validator.ts     ← Zod schemas for email/password
+
+================================================================================
+2. SUBJECT-BASED SYSTEM DESIGN
+================================================================================
+
+PROBLEM STATEMENT
+-----------------
+Multiple teachers upload content for different subjects (Maths, Science, English).
+A student should see only currently active content from their teacher, with
+independent rotation per subject. If Teacher A has 3 Maths items and 2 Science
+items, these should rotate independently:
+  - GET /content/live/teacher-a?subject=maths   → Rotates among 3 Maths items
+  - GET /content/live/teacher-a?subject=science → Rotates among 2 Science items
+
+SOLUTION: Subject-Isolated Rotation Queues
+
+Each subject maintains its own independent ContentSlot queue:
+
+Teacher A (UUID: teacher-123)
+│
+├─ MATHS subject
+│  ├─ ContentSlot[rotationOrder=0] → Content: "Algebra Basics"
+│  ├─ ContentSlot[rotationOrder=1] → Content: "Geometry"
+│  └─ ContentSlot[rotationOrder=2] → Content: "Calculus"
+│
+└─ SCIENCE subject
+   ├─ ContentSlot[rotationOrder=0] → Content: "Physics"
+   └─ ContentSlot[rotationOrder=1] → Content: "Chemistry"
+
+When query arrives: GET /content/live/teacher-123?subject=maths
+  1. Filter: status='APPROVED' AND subject='maths' AND teacherId='teacher-123'
+  2. Time-window check: startTime ≤ NOW ≤ endTime
+  3. Sort by ContentSlot.rotationOrder (ascending)
+  4. Apply rotation algorithm (see section 5)
+  5. Return currently active item from Maths queue
+     (Science queue unaffected, rotates independently)
+
+DATA MODEL: Subject-Based Isolation
+-----------------------------------
+
+Content table:
+  id (UUID)
+  title
+  subject ← "maths", "science", "english", etc. (indexed)
+  teacherId (FK to User)
+  status (PENDING, APPROVED, REJECTED)
+  startTime, endTime (time window)
+  ... other fields
+
+ContentSlot table (→ Rotation metadata):
+  id
+  subject ← Same as Content.subject
+  rotationOrder ← Position in queue (0, 1, 2, ...)
+  contentId (FK to Content)
+  
+  @@unique([subject, rotationOrder]) ← No duplicates per subject
+
+ContentSchedule table (→ Timing & duration):
+  id
+  contentId (FK to Content)
+  slotId (FK to ContentSlot)
+  startTime, endTime
+  rotationDurationMinutes (e.g., 5 minutes per rotation)
+
+QUERY EXAMPLE
+-------------
+Find currently active Maths content for Teacher A:
+
+  SELECT c.*, cs.*, slot.*
+  FROM Content c
+  INNER JOIN ContentSchedule cs ON c.id = cs.content_id
+  INNER JOIN ContentSlot slot ON cs.slot_id = slot.id
+  WHERE
+    c.status = 'APPROVED'
+    AND c.subject = 'maths'
+    AND c.teacher_id = 'teacher-a-uuid'
+    AND NOW() BETWEEN cs.start_time AND cs.end_time
+  ORDER BY slot.rotation_order ASC;
+
+Then apply rotation algorithm to determine which one is active RIGHT NOW.
+
+SCALING IMPLICATIONS
+--------------------
+- 1000 subjects × 100 content items per subject = 1M content items
+  Each subject's rotation is completely independent. No cross-subject
+  interference or computation.
+
+- Same teacher can have different rotation schedules for different subjects:
+  Maths cycles every 15 minutes, Science cycles every 30 minutes. They
+  don't affect each other.
+
+KEY FILES
+---------
+src/services/scheduling.service.ts   ← Core rotation algorithm
+src/services/content.service.ts      ← Content creation with subject slot
+prisma/schema.prisma                 ← Data model (Content, ContentSlot, 
+                                         ContentSchedule)
+
+================================================================================
+3. UPLOAD HANDLING APPROACH
+================================================================================
+
+UPLOAD FLOW (High-Level)
+------------------------
+
+Client: POST /content/upload (multipart/form-data)
+  ├─ file: binary (image file)
+  ├─ title: string
+  ├─ subject: string (must be in VALID_SUBJECTS)
+  ├─ startTime: ISO 8601 datetime
+  ├─ endTime: ISO 8601 datetime
+  └─ rotationDuration: integer (default: 5 min)
+
+Server Pipeline:
+  1. [Middleware] authenticate() ← Verify JWT
+  2. [Middleware] roleGuard(['TEACHER', 'PRINCIPAL']) ← Check role
+  3. [Middleware] uploadMiddleware ← Parse multipart/form-data with multer
+  4. [Controller] validate request body with Zod schema
+  5. [Service] UploadService.save() ← Validate file + write to disk
+  6. [Service] ContentService.createContent() ← Create records in transaction
+  7. [Response] Return 201 Created with content metadata
+
+DETAILED FLOW
+-------------
+
+Step 1: Multipart Parsing (src/controllers/content.controller.ts)
+  uploadMiddleware = multer.single('file')
+    ├─ Uses memoryStorage() (not disk)
+    ├─ Limits: maxSize = (handled manually)
+    └─ Stores raw file in req.file = Express.Multer.File
+       {
+         fieldname: 'file',
+         originalname: 'quiz.jpg',
+         encoding: '7bit',
+         mimetype: 'image/jpeg',
+         size: 2048000,
+         buffer: Buffer<...>   ← Raw bytes in memory
+       }
+
+Step 2: Zod Schema Validation (src/validators/content.validator.ts)
+  uploadContentSchema.parse(req.body) validates:
+    ├─ title: 1-255 chars (required)
+    ├─ subject: must be in ['maths', 'science', 'english', 'history', 'geography', 'social-studies']
+    ├─ description: optional, max 1000 chars
+    ├─ startTime: valid ISO 8601 datetime
+    ├─ endTime: valid ISO 8601 datetime
+    └─ Custom refine: startTime < endTime (rejects if violated)
+
+Step 3: File Validation & Storage (src/services/upload.service.ts)
+  UploadService.save(file, metadata) performs:
+
+  a) Extension Check
+     const ext = originalname.split('.').pop()?.toLowerCase()
+     if (!['jpg', 'jpeg', 'png', 'gif'].includes(ext)) {
+       throw new AppError('Invalid file type', 400)
+     }
+
+  b) Size Check
+     if (file.size > 10 * 1024 * 1024) {
+       throw new AppError('File too large (Max 10MB)', 400)
+     }
+
+  c) Magic Byte Validation (most important!)
+     JPG signature:  0xFF 0xD8 0xFF
+     PNG signature:  0x89 0x50 0x4E 0x47
+     GIF signature:  0x47 0x49 0x46
+
+     Compares file.buffer.subarray(0, signatureLen) against expected bytes.
+     Rejects if mismatch. Prevents disguised executables (e.g., .exe named as .jpg).
+
+  d) Secure Filename Generation
+     secureFilename = `${uuid()}.${ext}`
+     Prevents path traversal attacks (e.g., "../../etc/passwd.jpg")
+
+  e) File Write
+     Writes to: uploads/content/{uuid}.{ext}
+     Relative path is stored in DB: /uploads/content/{uuid}.{ext}
+
+  f) Return Metadata
+     { path: '/uploads/content/abc.jpg', type: 'jpg', size: 2048000 }
+
+Step 4: Content Record Creation (src/services/content.service.ts)
+  ContentService.createContent() executes in a transaction:
+
+  BEGIN TRANSACTION
+    ├─ Find max ContentSlot.rotationOrder for this subject
+    │  SELECT MAX(rotation_order) FROM ContentSlot WHERE subject = 'maths'
+    │  → Suppose returns 2, nextOrder = 3
+    │
+    ├─ Create Content record
+    │  INSERT INTO Content (title, subject, fileUrl, status, teacherId, ...)
+    │  status = 'UPLOADED' initially
+    │
+    ├─ Auto-transition to PENDING
+    │  UPDATE Content SET status = 'PENDING' (immediate, same transaction)
+    │
+    ├─ Create ContentSlot
+    │  INSERT INTO ContentSlot (subject, rotationOrder, contentId)
+    │  VALUES ('maths', 3, content-uuid)
+    │  ← Establishes position in subject's rotation queue
+    │
+    └─ Create ContentSchedule
+       INSERT INTO ContentSchedule (contentId, slotId, startTime, endTime, rotationDurationMinutes)
+       ← Links content to its time window and rotation slot
+  END TRANSACTION (atomic commit)
+
+All-or-nothing: If any step fails, entire transaction rolls back.
+Prevents orphaned content without slots or schedules.
+
+IDEMPOTENCY
+-----------
+Upload endpoint accepts Idempotency-Key header (UUID).
+If same key sent twice (network retry, user clicks twice), the second request
+is cached from Redis and returns identical response without:
+  - Writing file twice
+  - Creating duplicate content record
+  - Incrementing rotation order twice
+
+See section 8 (Middleware) for details.
+
+SECURITY CONSIDERATIONS
+-----------------------
+1. Magic bytes checked before writing → Prevents executable injection
+2. UUID filenames → Prevents enumeration or directory traversal
+3. Fixed upload directory → File stored in fixed path, not user-configurable
+4. Size limits enforced → Prevents disk exhaustion (10MB max)
+5. Extension whitelist → Only jpg/jpeg/png/gif allowed
+6. Zod validation on body → Prevents malformed input before file processing
+
+STORAGE PROVIDER INTERFACE
+--------------------------
+interface StorageProvider {
+  save(file: Express.Multer.File, metadata): Promise<{ path, type, size }>;
+}
+
+Two implementations:
+  1. LocalStorageProvider (default)
+     - Writes to local disk at uploads/content/
+     - Suitable for development and single-server deployments
+
+  2. S3StorageProvider (stub)
+     - Would write to AWS S3
+     - Set STORAGE=s3 in .env to activate
+     - Allows horizontal scaling without shared filesystem
+
+KEY FILES
+---------
+src/services/upload.service.ts       ← File validation + storage logic
+src/controllers/content.controller.ts ← Upload handler + multer config
+src/validators/content.validator.ts   ← Zod schema for upload body
+
+================================================================================
+4. APPROVAL WORKFLOW DESIGN
+================================================================================
+
+CONTENT LIFECYCLE STATE MACHINE
+-------------------------------
+
+       ┌──────────┐
+       │ UPLOADED │ (File written, record created)
+       └────┬─────┘
+            │ (auto-transition immediate)
+            ▼
+       ┌──────────┐
+       │ PENDING  │ (Awaiting Principal review)
+       └────┬─────┘
+            │
+            ├──→ ┌──────────┐ (Visible in rotation, immutable)
+            │    │ APPROVED │
+            │    └──────────┘
+            │
+            └──→ ┌──────────┐ (Rejected, reason visible to teacher)
+                 │ REJECTED │
+                 └──────────┘
+
+DESIGN DECISION: IMMEDIATE PENDING TRANSITION
 ----------------------------------------------
-Upload is handled using multer with in-memory storage (memoryStorage). The file
-buffer is passed to the UploadService which performs:
+Spec defines states as:
+  - uploaded: File has been written
+  - pending: Submitted for review
 
-  Step 1: Extension check (only jpg, jpeg, png, gif allowed)
-  Step 2: File size check (max 10MB)
-  Step 3: Magic byte validation (compares first bytes of buffer to known signatures)
-           - JPG/JPEG: 0xFF 0xD8 0xFF
-           - PNG:      0x89 0x50 0x4E 0x47
-           - GIF:      0x47 0x49 0x46
-  Step 4: Generate a UUID-based secure filename to prevent path traversal attacks
-  Step 5: Write file to local disk at uploads/content/
+Implementation:
+  Content.status = 'UPLOADED' is created and immediately transitioned to
+  'PENDING' in the same transaction. There is NO separate "submit for review"
+  action by the teacher. Uploading the file = submitting for review.
 
-The StorageProvider interface is designed for easy swap to S3:
-  export interface StorageProvider {
-    save(file, metadata): Promise<{ path, type, size }>;
+Rationale:
+  - Simpler user experience (no extra UI step)
+  - Matches typical CMS workflows
+  - Spec doesn't require a separate submit action
+
+APPROVAL WORKFLOW (Principal-Only)
+----------------------------------
+
+1. Principal Navigates to Pending Queue
+   GET /content/admin/pending?limit=20
+
+   Response includes all PENDING content across all teachers:
+   {
+     items: [
+       {
+         id: "uuid",
+         title: "Maths Quiz",
+         author: { id, name },
+         subject: "maths",
+         status: "PENDING",
+         schedule: { startTime, endTime },
+         createdAt: "2026-04-26T10:30:00Z"
+       },
+       ...
+     ],
+     total: 42
+   }
+
+2. Principal Reviews Content
+   (Presumably view file at fileUrl, then click approve/reject)
+
+3. Principal Approves Content
+   POST /content/admin/{contentId}/approve
+
+   Server:
+     ├─ Begin transaction
+     ├─ Fetch content by ID
+     ├─ Application-level check:
+     │   if (content.status === 'APPROVED') → Error 409
+     │   if (content.status !== 'PENDING') → Error 400
+     │
+     ├─ Update:
+     │   SET status = 'APPROVED'
+     │   SET approvedById = principal_id
+     │   SET approvedAt = now
+     │
+     ├─ Create AuditLog entry
+     │   { userId, action: 'approve', entityType: 'content', entityId, changes }
+     │
+     └─ Commit transaction
+
+   Response 200:
+   {
+     success: true,
+     data: { id, status: 'APPROVED', approvedAt: "2026-04-26T10:35:00Z" }
+   }
+
+4. Principal Rejects Content
+   POST /content/admin/{contentId}/reject
+   Body: { reason: "Image quality is too low." }
+
+   Server:
+     ├─ Validate reason: 5-500 chars
+     ├─ Same transaction logic as approve, but:
+     │   SET status = 'REJECTED'
+     │   SET rejectionReason = body.reason
+     │   (approvedById stays NULL)
+     │
+     └─ Create AuditLog entry
+
+   Response 200:
+   {
+     success: true,
+     data: { id, status: 'REJECTED', rejectionReason: "Image quality..." }
+   }
+
+IMMUTABILITY ENFORCEMENT (Two Layers)
+-------------------------------------
+
+Layer 1: Application-Level Check (Fast Fail)
+  File: src/services/content.service.ts
+  
+  if (content.status === 'APPROVED') {
+    throw new AppError('Cannot modify approved content', 409);
   }
 
-Key Files:
-  - src/services/upload.service.ts
-  - src/controllers/content.controller.ts (uploadMiddleware)
+  Returns 409 Conflict immediately without hitting database.
+  Prevents accidental double-approval attempts.
 
-4. Approval Workflow Design
-----------------------------------------------
-Content moves through the following lifecycle:
+Layer 2: Database-Level Trigger (Safety Net)
+  File: prisma/migrations/20260426120544_init/migration.sql
 
-  uploaded --> pending --> approved
-                      --> rejected (with mandatory reason)
+  CREATE TRIGGER content_update_lock
+  BEFORE UPDATE ON "Content"
+  FOR EACH ROW
+  WHEN (OLD.status = 'APPROVED')
+  EXECUTE FUNCTION prevent_approved_modification();
 
-On Upload:
-  - Content is created with status UPLOADED (awaiting teacher submission)
-  - Status immediately transitions to PENDING on save (teacher submits for review)
-  - A ContentSchedule and ContentSlot are created atomically in the same transaction
+  Function:
+    BEGIN
+      RAISE EXCEPTION 'Immutable: Cannot modify approved content (id=%)', OLD.id;
+    END;
 
-On Approval/Rejection:
-  - Only PRINCIPAL role can call approve/reject endpoints
-  - Application-level check: throws 409 if content is already APPROVED
-  - Database-level trigger: PostgreSQL trigger prevents any UPDATE on APPROVED rows
-    (ADR-003: Immutable Approvals)
-  - Rejection requires a reason (enforced by Zod schema validation)
-  - Approval/rejection action is written to AuditLog for accountability
+  Protects against direct SQL updates or race conditions.
+  If somehow a modification bypasses app logic, DB trigger blocks it.
 
-Key Files:
-  - src/controllers/content.controller.ts (approve, reject)
-  - src/services/content.service.ts (updateStatus)
-  - prisma/migrations/20260426120544_init/migration.sql (trigger)
+AUDIT TRAIL
+-----------
+Every approval/rejection creates an AuditLog record:
 
-5. Scheduling / Rotation Logic (VERY IMPORTANT)
-----------------------------------------------
-The scheduling algorithm is a pure, stateless, deterministic function.
-No server-side timers, WebSockets, or cron jobs are needed.
+AuditLog {
+  id: UUID
+  userId: Principal's UUID
+  action: 'approve' | 'reject'
+  entityType: 'content'
+  entityId: Content UUID
+  changes: JSON { status, rejectionReason, rotationSlots }
+  timestamp: DateTime
+}
 
-Algorithm (Epoch-Based Modulo Formula):
-  Given a sorted list of approved content items (sorted by rotationOrder):
+Query history of a content item:
+  SELECT * FROM AuditLog
+  WHERE entity_type = 'content' AND entity_id = 'uuid'
+  ORDER BY timestamp DESC;
+
+REJECTION REASON VISIBILITY
+---------------------------
+Teacher views their uploads via GET /content/my-uploads
+
+Response includes rejected items with reasons:
+  {
+    items: [
+      {
+        id: "uuid",
+        title: "Maths Quiz",
+        status: "REJECTED",
+        rejectionReason: "Image quality is too low. Please resubmit."
+      }
+    ]
+  }
+
+Teacher can then re-upload improved version.
+
+KEY FILES
+---------
+src/controllers/content.controller.ts ← approve(), reject() handlers
+src/services/content.service.ts       ← updateStatus() with transaction logic
+prisma/schema.prisma                  ← Content model with status enum
+prisma/migrations/.../migration.sql   ← Database trigger for immutability
+
+================================================================================
+5. SCHEDULING/ROTATION LOGIC (CORE ALGORITHM)
+================================================================================
+
+THE PROBLEM: Stateless Broadcasting at Scale
+---------------------------------------------
+
+Without a centralized server maintaining rotation state:
+  - Students at different times see different content
+  - Server instances can't coordinate
+  - Cache coherency becomes impossible
+
+Example failure mode:
+  Time 10:05
+  ├─ Server A computes: Active = Content #2
+  ├─ Server B computes: Active = Content #1
+  └─ Same student might see different content depending on which instance
+     answered their request!
+
+THE SOLUTION: Deterministic Time-Based Calculation
+---------------------------------------------------
+
+Given current time, content list, and rotation metadata, the active content
+is deterministically computable WITHOUT any mutable state.
+
+Formula:
+  i = floor((T_now - T_anchor) / D) % N
+
+Where:
+  T_now    = Current timestamp (milliseconds since epoch)
+  T_anchor = Start time of rotation cycle (stored in DB as startTime)
+  D        = Duration of each content slot (rotationDurationMinutes * 60000 ms)
+  N        = Number of approved content items
+  i        = Index of currently active content (0 to N-1)
+
+The formula is deterministic:
+  Same inputs (time, content list, subject) always produce same output.
+  Multiple servers compute the same result independently.
+  No shared state needed!
+
+DETAILED EXAMPLE
+----------------
+
+Setup:
+  Subject: Maths
+  Teacher: teacher-123
+  Time window: 10:00-11:00
+  Active content (sorted by rotationOrder):
+    - rotationOrder=0: "Algebra"     (5 min duration)
+    - rotationOrder=1: "Geometry"    (5 min duration)
+    - rotationOrder=2: "Calculus"    (5 min duration)
+
+Timeline:
+  10:00-10:05  → Algebra   (position 0, index 0)
+  10:05-10:10  → Geometry  (position 5, index 1)
+  10:10-10:15  → Calculus  (position 10, index 2)
+  10:15-10:20  → Algebra   (position 0 again, cycles)
+  ...
+
+Calculation at T = 10:07:
+  T_now = 10:07:00 (epoch in ms)
+  T_anchor = 10:00:00 (epoch in ms)
+  D = 5 * 60 * 1000 = 300,000 ms
+  N = 3
+
+  elapsed = T_now - T_anchor = 7 minutes = 420,000 ms
+  positionInCycle = elapsed % (3 * D)
+                  = 420,000 % 900,000
+                  = 420,000 ms
+                  = 7 minutes
+
+  Which content covers minute 7?
+    - Algebra:  0-5 min
+    - Geometry: 5-10 min   ← Minute 7 falls here
+    - Calculus: 10-15 min
+
+  Result: Geometry is active
+  Remaining time: 10:10 - 10:07 = 3 minutes
+
+IMPLEMENTATION IN CODE
+----------------------
+
+File: src/services/scheduling.service.ts
+
+static calculateActiveContentByRotation(
+    contentList: ContentWithScheduleAndSlot[],
+    currentTime: Date
+): RotationResult {
+
+    // 1. Filter by time window
+    const activeContents = contentList.filter(c =>
+        c.status === 'APPROVED'
+        && c.schedule
+        && currentTime >= c.schedule.startTime
+        && currentTime <= c.schedule.endTime
+    );
+
+    if (activeContents.length === 0)
+        return { content: null, message: "No content available" };
+
+    // 2. Sort by rotation order
+    activeContents.sort((a, b) =>
+        (a.slots[0]?.rotationOrder ?? 999)
+        - (b.slots[0]?.rotationOrder ?? 999)
+    );
+
+    // 3. Calculate cycle duration
+    const firstSchedule = activeContents[0].schedule!;
+    const cycleStartTime = new Date(firstSchedule.startTime);
+    const totalCycleDurationMs = activeContents.reduce((sum, content) =>
+        sum + (content.schedule!.rotationDurationMinutes * 60 * 1000),
+        0
+    );
+
+    // 4. Find position in current cycle
+    const elapsedMs = Math.max(0, currentTime.getTime() - cycleStartTime.getTime());
+    const positionInCycle = elapsedMs % totalCycleDurationMs;
+
+    // 5. Binary search or linear scan to find active index
+    let accumulated = 0;
+    for (let i = 0; i < activeContents.length; i++) {
+        const contentDurationMs = activeContents[i].schedule!.rotationDurationMinutes * 60 * 1000;
+        
+        if (positionInCycle < accumulated + contentDurationMs) {
+            return {
+                content: activeContents[i],
+                activeUntil: new Date(currentTime.getTime() + (accumulated + contentDurationMs - positionInCycle)),
+                rotationInfo: {
+                    totalContents: activeContents.length,
+                    currentIndex: i,
+                    rotationOrder: activeContents[i].slots[0]?.rotationOrder ?? -1,
+                    remainingSeconds: Math.floor((accumulated + contentDurationMs - positionInCycle) / 1000)
+                }
+            };
+        }
+        
+        accumulated += contentDurationMs;
+    }
+}
+
+EDGE CASES
+----------
+
+1. No approved content
+   → Return null with 200 OK (not an error per spec)
+
+2. Approved but outside time window
+   → Return null (content not yet active or already expired)
+
+3. Single content item
+   → N=1, always returns that item (no rotation needed)
+
+4. Content with zero duration
+   → Handled: duration defaults to 5 min in DB migration
+
+5. Concurrent access from 10,000 students at same time
+   → All compute same result independently, no lock contention
+
+PERFORMANCE CHARACTERISTICS
+---------------------------
+
+Time Complexity: O(M log M) where M = content items per subject
+  - Database query: O(log M) index lookup
+  - Sort by rotationOrder: O(M log M)
+  - Loop to find active: O(M)
+  Total: O(M log M)
+
+Space Complexity: O(M) for sorted array
+
+Typical case (M=10): <1ms computation
+
+Caching Strategy: Dynamic TTL
+  After computing activeContent, calculate activeUntil timestamp.
+  Cache TTL = seconds until activeUntil.
   
-  1. Filter: Only content where now >= startTime AND now <= endTime
-  2. Sort: By ContentSlot.rotationOrder (ascending)
-  3. Calculate total cycle duration:
-     totalDuration = sum of rotationDurationMinutes for all active items (in ms)
-  4. Calculate elapsed time since first item's start:
-     elapsed = now - firstItem.startTime
-  5. Find position in cycle:
-     position = elapsed % totalDuration
-  6. Walk through items accumulating durations until position is covered:
-     → The item whose window contains the position is the ACTIVE item
+  Result: Cache expires exactly when content rotates!
+          Zero stale data, perfect invalidation.
 
-Example (Maths subject, 3 items, each 5 minutes):
-  Item A: rotationOrder=0, duration=5min  (0-5 min in cycle)
-  Item B: rotationOrder=1, duration=5min  (5-10 min in cycle)
-  Item C: rotationOrder=2, duration=5min  (10-15 min in cycle)
+DISTRIBUTED CORRECTNESS
+-----------------------
+
+Server Instance A                Server Instance B
+(Receives request at 10:06:30)   (Receives request at 10:06:31)
+
+Instance A:
+  elapsed = 6.5 min = 390,000 ms
+  position = 390,000 % 900,000 = 390,000
+  → Falls in Geometry window → Index 1
+
+Instance B:
+  elapsed = 6.5+ min ≈ 391,000 ms
+  position = 391,000 % 900,000 = 391,000
+  → Still falls in Geometry window → Index 1
+
+Both return same content despite different request times (within same rotation slot).
+
+After 10:10 (rotation boundary):
+  elapsed > 600,000 ms
+  position wraps to different window
+  Both instances compute new active index in sync
+
+KEY FILES
+---------
+src/services/scheduling.service.ts   ← Core algorithm
+src/services/broadcast.service.ts    ← Caching + SingleFlight wrapper
+src/controllers/broadcast.controller.ts ← HTTP endpoint
+
+================================================================================
+6. DATABASE DESIGN DECISIONS
+================================================================================
+
+SCHEMA OVERVIEW
+---------------
+
+User
+  id: UUID (PK)
+  name: String
+  email: String (UNIQUE)
+  password_hash: String (bcrypt)
+  role: ENUM (PRINCIPAL, TEACHER)
+  createdAt, updatedAt: DateTime
   
-  At T+7 minutes: position = 7 % 15 = 7 → falls in Item B's window (5-10) → Item B is live
-  At T+16 minutes: position = 16 % 15 = 1 → falls in Item A's window (0-5) → Item A is live
+  Relations:
+    uploads: Content[] @relation("UploadedContent")
+    approvals: Content[] @relation("ApprovedContent")
+    auditLogs: AuditLog[]
 
-The algorithm returns:
-  - The active content item
-  - activeUntil: when the next rotation happens
-  - rotationInfo: metadata about the current rotation state
+Content
+  id: UUID (PK)
+  title: String
+  description: String?
+  subject: String (indexed)
+  fileUrl: String (relative path like /uploads/content/abc.jpg)
+  fileType: String (extension: jpg, png, gif)
+  fileSize: Int (bytes)
+  status: ENUM (UPLOADED, PENDING, APPROVED, REJECTED)
+  rejectionReason: String? (only populated if REJECTED)
+  
+  teacherId: UUID (FK)
+  approvedById: UUID? (FK, nullable)
+  approvedAt: DateTime?
+  
+  createdAt, updatedAt: DateTime
+  
+  Relations:
+    teacher: User @relation("UploadedContent")
+    approvedBy: User? @relation("ApprovedContent")
+    schedule: ContentSchedule?
+    slots: ContentSlot[]
+  
+  Indexes:
+    - [subject, status] for filtering by subject + status
+    - [status, createdAt DESC] for Principal dashboard (index-only scans)
 
-This activeUntil value is used as the Redis cache TTL, so the cache expires
-exactly when the content rotates, ensuring students always get fresh content
-without unnecessary DB queries.
+ContentSlot
+  id: UUID (PK)
+  subject: String
+  rotationOrder: Int
+  contentId: UUID (FK)
+  
+  createdAt, updatedAt: DateTime
+  
+  Constraint:
+    @@unique([subject, rotationOrder])
+    ← No two items can have same position in same subject's queue
 
-Key Files:
-  - src/services/scheduling.service.ts (calculateActiveContentByRotation)
-  - src/controllers/broadcast.controller.ts (getLiveContent)
+ContentSchedule
+  id: UUID (PK)
+  contentId: UUID (FK, UNIQUE)
+  slotId: UUID (FK)
+  startTime: DateTime
+  endTime: DateTime
+  rotationDurationMinutes: Int
+  
+  createdAt, updatedAt: DateTime
+  
+  Indexes:
+    - [startTime, endTime] for time-window range queries
 
-6. Database Design Decisions
-----------------------------------------------
-Tables:
+AuditLog
+  id: UUID (PK)
+  userId: UUID (FK)
+  action: String (approve, reject)
+  entityType: String (content)
+  entityId: UUID
+  changes: JSON (embedded metadata)
+  timestamp: DateTime
+  
+  Indexes:
+    - [entityType, entityId] for per-content history
+    - [userId] for per-principal actions
 
-  User
-    - id (uuid), name, email, password_hash, role (PRINCIPAL/TEACHER)
-    - Indexed on email (unique) for O(1) login lookup
+Analytics (Optional)
+  id: UUID (PK)
+  contentId: UUID (FK)
+  teacherId: UUID (FK)
+  subject: String
+  viewCount: Int
+  date: DateTime (for daily aggregation)
+  
+  @@unique([contentId, date]) for upsert
+  
+  Indexes:
+    - [subject]
+    - [contentId]
 
-  Content
-    - id, title, description, subject, file_path, file_type, file_size
-    - status (UPLOADED/PENDING/APPROVED/REJECTED), rejection_reason
-    - uploaded_by (FK -> User), approved_by (FK -> User), approved_at
-    - Composite indexes: [subject, status] and [status, created_at DESC]
-    - The [status, created_at DESC] index enables the Principal dashboard
-      to do an index-only scan for PENDING content without sorting a full table
+KEY DESIGN DECISIONS
+--------------------
 
-  ContentSlot (Subject-based rotation order)
-    - id, subject, rotation_order, content_id (FK -> Content)
-    - Unique constraint on [subject, rotation_order]
-    - This is the source of truth for broadcast ordering per subject
+1. Separate ContentSlot and ContentSchedule tables
+   Why?
+     - ContentSlot stores position in rotation (responsibility: order)
+     - ContentSchedule stores timing (responsibility: when)
+     - Separation enables clear responsibilities
+     - Spec mentions both slot_id and rotation_order in requirements
 
-  ContentSchedule (Time window + duration)
-    - id, content_id (FK -> Content), slot_id (FK -> ContentSlot)
-    - start_time, end_time, rotation_duration_minutes
-    - Indexed on [start_time, end_time] for time-window queries
+2. All text IDs are UUIDs, not sequential integers
+   Why?
+     - UUID is non-enumerable (can't guess next ID)
+     - Security: prevents API scraping (guessing /content/1, /content/2)
+     - Distributed systems: no coordinator needed for ID generation
+     - Database replication/sharding: UUIDs don't conflict
 
-  AuditLog
-    - Append-only log of all approval/rejection actions
-    - Indexed on [entity_type, entity_id] for per-content history
+3. Index on [status, createdAt DESC]
+   Why?
+     - Principal dashboard: GET /admin/pending requires all PENDING items
+     - Index is ordered, so no temporary sort needed
+     - Index-only scan: satisfies query without touching main table
+     - Fast even with millions of total content items
 
-Design Decisions:
-  - ContentSlot and ContentSchedule are kept separate to maintain the spec's
-    intention: Slots define the "position" in the rotation, Schedules define "when"
-  - All FKs use CASCADE DELETE so removing a Content item cleans up related rows
-  - UUID primary keys for all tables (no sequential IDs to enumerate)
+4. Unique constraint on [subject, rotationOrder]
+   Why?
+     - Prevents duplicate entries in same subject's queue
+     - Database enforces: no application logic needed
+     - Unique constraint is itself an index, so lookup is O(log N)
 
-7. Folder Structure
-----------------------------------------------
+5. Immutability trigger at database level
+   Why?
+     - Defense-in-depth: if app code is bypassed, DB still protects
+     - SQL injection or direct DB access can't modify approved content
+     - Ensures ACID property: consistency maintained
+
+6. Analytics table uses daily aggregation
+   Why?
+     - Millions of views per day → Can't write each one individually
+     - Background worker aggregates views (batching)
+     - Reduces write pressure on main database by 1000x
+     - Trade-off: Analytics data is 5-minute delayed (acceptable)
+
+7. AuditLog is append-only
+   Why?
+     - Never updated or deleted
+     - Provides immutable history of all content actions
+     - Compliance: can audit who approved what and when
+     - Simple schema: no complex constraints
+
+RELATIONSHIPS & CASCADING
+--------------------------
+
+User deleted:
+  → Content.teacherId remains (no cascade, prevents deletion)
+  → Content.approvedById = NULL (cascade, but unusual)
+  Design: Don't delete teachers if they have content
+
+Content deleted:
+  → ContentSlot deleted (CASCADE)
+  → ContentSchedule deleted (CASCADE)
+  → AuditLog entries remain (no cascade, for history)
+
+ContentSlot deleted:
+  → ContentSchedule.slotId becomes NULL (if not already cascaded)
+
+PERFORMANCE TUNING
+------------------
+
+Index Usage by Query:
+
+Query                                    Index Used
+========================================|=====================================
+GET /admin/pending (all PENDING)        [status, createdAt DESC] (index-only)
+GET /admin/pending?subject=maths         [subject] then filter [status]
+GET /live/:teacher?subject=maths         [subject], [startTime, endTime]
+GET /my-uploads (teacher's uploads)      PK lookup on teacherId
+                                         then filter [status] (small result set)
+
+Query Planner Statistics:
+  - [status, createdAt DESC] scans ~20 rows (efficient)
+  - [subject, status] exact match ~100 rows (efficient)
+  - [startTime, endTime] range scan variable (depends on time window width)
+
+MIGRATION STRATEGY
+------------------
+
+Prisma handles migrations. Run before deployment:
+
+  npx prisma migrate deploy
+
+Creates/applies all .sql files in prisma/migrations/ in order.
+Idempotent: safe to run multiple times.
+
+Rollback (if needed):
+  npx prisma migrate resolve --rolled-back <migration_name>
+  npx prisma migrate deploy (to reapply)
+
+KEY FILES
+---------
+prisma/schema.prisma                ← Data model definition
+prisma/migrations/                  ← Migration files (versioned SQL)
+src/config/prisma.ts               ← Prisma client setup with pg pool
+
+================================================================================
+7. FOLDER STRUCTURE & ORGANIZATION
+================================================================================
+
+DIRECTORY TREE
+--------------
+
 content-broadcasting-system/
+│
 ├── src/
-│   ├── app.ts              (Express app setup, middleware registration)
-│   ├── server.ts           (HTTP server, process signal handlers)
+│   │
+│   ├── app.ts
+│   │   ├─ Express app initialization
+│   │   ├─ Middleware registration (order matters!)
+│   │   ├─ Route mounting (/api/v1/*)
+│   │   └─ Error handler setup
+│   │
+│   ├── server.ts
+│   │   ├─ HTTP server start (listen on PORT)
+│   │   ├─ Process signal handlers (unhandledRejection, uncaughtException)
+│   │   └─ Graceful shutdown (if needed for prod)
+│   │
 │   ├── config/
-│   │   ├── prisma.ts       (Prisma client with pg-pool driver adapter)
-│   │   ├── redis.ts        (ioredis singleton)
-│   │   └── constants.ts    (VALID_SUBJECTS list)
+│   │   ├── constants.ts
+│   │   │   └─ VALID_SUBJECTS whitelist (maths, science, english, ...)
+│   │   │
+│   │   ├── prisma.ts
+│   │   │   ├─ PrismaClient initialization
+│   │   │   ├─ Database URL from .env
+│   │   │   ├─ pg.Pool connection pooling (max 20 connections)
+│   │   │   └─ PrismaPg adapter (modern driver)
+│   │   │
+│   │   └── redis.ts
+│   │       ├─ ioredis client initialization
+│   │       ├─ Redis URL from .env
+│   │       ├─ Error handler for connection issues
+│   │       └─ Singleton export
+│   │
 │   ├── controllers/
 │   │   ├── auth.controller.ts
+│   │   │   ├─ login() → Calls AuthService.login()
+│   │   │   ├─ register() → Calls AuthService.register()
+│   │   │   ├─ logout() → Calls AuthService.logout()
+│   │   │   └─ Zod validation before delegation
+│   │   │
 │   │   ├── content.controller.ts
-│   │   └── broadcast.controller.ts
+│   │   │   ├─ uploadContent() → File handling + ContentService.createContent()
+│   │   │   ├─ approve() → ContentService.updateStatus('APPROVED')
+│   │   │   ├─ reject() → ContentService.updateStatus('REJECTED', reason)
+│   │   │   ├─ getMyUploads() → Teacher's own uploads
+│   │   │   ├─ getPendingContent() → Principal's review queue
+│   │   │   ├─ listAllContent() → Principal's all-content view
+│   │   │   └─ uploadMiddleware → multer.single('file')
+│   │   │
+│   │   ├── broadcast.controller.ts
+│   │   │   ├─ getLiveContent() → Public endpoint (no auth)
+│   │   │   ├─ Subject validation
+│   │   │   ├─ Delegates to BroadcastService
+│   │   │   └─ Response: { content } or { content: null }
+│   │   │
+│   │   ├── user.controller.ts
+│   │   │   ├─ getMe() → Authenticated user's profile
+│   │   │   └─ listTeachers() → PRINCIPAL-only list of all teachers
+│   │   │
+│   │   └── analytics.controller.ts
+│   │       └─ getSystemStats() → PRINCIPAL-only system analytics
+│   │
 │   ├── services/
-│   │   ├── content.service.ts    (Business logic, transactions)
-│   │   ├── scheduling.service.ts (Rotation algorithm)
-│   │   └── upload.service.ts     (File validation & storage)
+│   │   ├── auth.service.ts
+│   │   │   ├─ register() → bcrypt.hash() + create User + jwt.sign()
+│   │   │   ├─ login() → bcrypt.compare() + jwt.sign()
+│   │   │   ├─ logout() → Redis blocklist for token revocation
+│   │   │   └─ generateToken() → jwt.sign() helper
+│   │   │
+│   │   ├── content.service.ts
+│   │   │   ├─ createContent() → File + schedule + slot in transaction
+│   │   │   ├─ updateStatus() → Approval/rejection with immutability check
+│   │   │   ├─ getPendingContent() → PENDING items (paginated)
+│   │   │   ├─ getContentByTeacher() → Teacher's uploads (paginated)
+│   │   │   └─ getAllContent() → All content by status (PRINCIPAL, paginated)
+│   │   │
+│   │   ├── broadcast.service.ts
+│   │   │   ├─ getLiveContent() → Redis cache + SingleFlight
+│   │   │   ├─ Wraps SchedulingService.getActiveContent()
+│   │   │   ├─ Calculates cache TTL dynamically
+│   │   │   └─ Triggers async analytics (fire & forget)
+│   │   │
+│   │   ├── scheduling.service.ts
+│   │   │   ├─ calculateActiveContentByRotation() → Core algorithm
+│   │   │   ├─ getActiveContent() → DB query + algorithm
+│   │   │   └─ Time-window filtering + rotation logic
+│   │   │
+│   │   ├── upload.service.ts
+│   │   │   ├─ LocalStorageProvider → Local disk storage
+│   │   │   ├─ S3StorageProvider → (Stub for AWS S3)
+│   │   │   └─ File validation (ext, size, magic bytes)
+│   │   │
+│   │   ├── user.service.ts
+│   │   │   ├─ getProfile() → Fetch user by ID
+│   │   │   └─ getTeachers() → Fetch all TEACHER role users
+│   │   │
+│   │   └── analytics.service.ts
+│   │       ├─ getSubjectUsage() → Views per subject (aggregated)
+│   │       └─ getContentStats() → Top content by views
+│   │
 │   ├── middlewares/
-│   │   ├── auth.ts               (authenticate, roleGuard)
-│   │   ├── errorHandler.ts       (Global error handler, AppError class)
-│   │   ├── idempotency.ts        (Redis-backed idempotency guard)
-│   │   ├── rateLimiter.ts        (Sliding window Redis rate limiter)
-│   │   └── logging.middleware.ts (HTTP request/response logger)
+│   │   ├── auth.ts
+│   │   │   ├─ authenticate() → JWT verification + blocklist check
+│   │   │   └─ roleGuard(roles) → RBAC enforcement
+│   │   │
+│   │   ├── errorHandler.ts
+│   │   │   ├─ AppError class → Custom error with statusCode
+│   │   │   └─ errorHandler() → Global error catching + JSON response
+│   │   │
+│   │   ├── idempotency.ts
+│   │   │   ├─ idempotencyGuard() → Idempotency-Key header checking
+│   │   │   ├─ Redis-backed response caching (24h)
+│   │   │   └─ Intercepts res.json() for successful responses
+│   │   │
+│   │   ├── rateLimiter.ts
+│   │   │   ├─ apiLimiter() → Sliding window rate limiting
+│   │   │   ├─ Lua script for atomic Redis operations
+│   │   │   ├─ 100 req/min per IP
+│   │   │   └─ Returns 429 on breach
+│   │   │
+│   │   └── logging.middleware.ts
+│   │       ├─ requestLogger() → Winston-based HTTP logging
+│   │       ├─ Method, path, status, duration, IP, user ID
+│   │       └─ Logs after response sent
+│   │
 │   ├── routes/
 │   │   ├── auth.ts
+│   │   │   ├─ POST /login
+│   │   │   ├─ POST /register
+│   │   │   └─ POST /logout (protected)
+│   │   │
 │   │   ├── content.ts
-│   │   └── public.ts
+│   │   │   ├─ POST /upload (protected: TEACHER/PRINCIPAL)
+│   │   │   ├─ GET  /my-uploads (protected)
+│   │   │   ├─ GET  /admin/pending (protected: PRINCIPAL)
+│   │   │   ├─ GET  /admin/all (protected: PRINCIPAL)
+│   │   │   ├─ POST /admin/:id/approve (protected: PRINCIPAL)
+│   │   │   └─ POST /admin/:id/reject (protected: PRINCIPAL)
+│   │   │
+│   │   ├── public.ts
+│   │   │   └─ GET /live/:teacherId (public, rate-limited)
+│   │   │
+│   │   ├── user.ts
+│   │   │   ├─ GET /me (protected)
+│   │   │   └─ GET /teachers (protected)
+│   │   │
+│   │   └── analytics.ts
+│   │       └─ GET /system (protected: PRINCIPAL)
+│   │
 │   ├── validators/
 │   │   ├── auth.validator.ts
+│   │   │   ├─ loginSchema → email, password
+│   │   │   └─ registerSchema → name, email, password, role
+│   │   │
 │   │   └── content.validator.ts
+│   │       ├─ uploadContentSchema → title, subject, time window, duration
+│   │       └─ approvalSchema → status, rejection reason
+│   │
+│   ├── models/
+│   │   └── user.model.ts
+│   │       ├─ UserModel.sanitize() → Remove password_hash
+│   │       ├─ UserModel.isPrincipal()
+│   │       └─ UserModel.isTeacher()
+│   │
+│   ├── types/
+│   │   ├── auth.types.ts
+│   │   │   ├─ LoginResponse
+│   │   │   └─ AuthUser
+│   │   │
+│   │   ├── content.types.ts
+│   │   │   ├─ CreateContentDTO
+│   │   │   └─ ContentFilters
+│   │   │
+│   │   ├── scheduling.types.ts
+│   │   │   └─ RotationResult
+│   │   │
+│   │   └── common.types.ts
+│   │       └─ APIResponse<T>
+│   │
 │   ├── utils/
-│   │   ├── logger.ts       (Winston structured JSON logger)
-│   │   └── singleFlight.ts (Request collapsing for cache miss protection)
+│   │   ├── logger.ts
+│   │   │   ├─ Winston logger configuration
+│   │   │   └─ JSON structured logging
+│   │   │
+│   │   ├── singleFlight.ts
+│   │   │   ├─ SingleFlight class
+│   │   │   ├─ do<T>(key, fn) → Concurrent request collapsing
+│   │   │   └─ Prevents thundering herd on cache miss
+│   │   │
+│   │   └── rotationEngine.ts
+│   │       └─ getActiveContentIndex() → Pure function rotation
+│   │
 │   └── workers/
-│       └── analyticsWorker.ts (Redis Stream consumer for view analytics)
+│       └── analyticsWorker.ts
+│           ├─ Redis Stream consumer
+│           ├─ Aggregates view events in batches
+│           ├─ Bulk upserts to Analytics table
+│           └─ Runs as separate process
+│
 ├── prisma/
 │   ├── schema.prisma
+│   │   └─ Prisma data model (all tables + relations)
+│   │
 │   └── migrations/
+│       └── 20260426120544_init/
+│           ├── migration.sql → CREATE TABLE statements
+│           └── migration_lock.toml
+│
 ├── tests/
 │   ├── unit/
+│   │   └── services/
+│   │       └── SchedulingService.test.ts
+│   │           ├─ Empty content list
+│   │           ├─ Time window boundaries
+│   │           ├─ 2-item rotation (A, B)
+│   │           ├─ 3-item rotation (A, B, C)
+│   │           ├─ Looping behavior
+│   │           └─ Remaining seconds calculation
+│   │
 │   └── integration/
-├── uploads/content/        (Local file storage)
+│       └── content.workflow.test.ts
+│           ├─ Subject validation
+│           ├─ Upload validation
+│           ├─ Immutability checks
+│           └─ RBAC enforcement
+│
+├── uploads/
+│   └── content/
+│       └─ (File storage directory, created at runtime)
+│
 ├── docker-compose.yml
+│   ├─ PostgreSQL service (5433)
+│   ├─ Redis service (6379)
+│   └─ Volumes for data persistence
+│
+├── .env.example
+│   ├─ DATABASE_URL
+│   ├─ REDIS_URL
+│   ├─ JWT_SECRET
+│   ├─ PORT
+│   └─ LOG_LEVEL
+│
+├── .gitignore
+│   ├─ node_modules/
+│   ├─ .env
+│   ├─ dist/
+│   └─ uploads/
+│
+├── package.json
+│   ├─ "dev" → npm run dev (ts-node with watch)
+│   ├─ "worker" → npm run worker (analytics worker)
+│   ├─ "build" → tsc (TypeScript compilation)
+│   ├─ "test" → jest (unit + integration)
+│   └─ Dependencies (express, prisma, zod, etc.)
+│
+├── tsconfig.json
+│   ├─ "strict": true
+│   ├─ "target": "ES2020"
+│   ├─ "module": "commonjs"
+│   └─ "outDir": "dist"
+│
 ├── README.md
-└── architecture-notes.txt
+│   └─ Quick start guide
+│
+├── architecture-notes.txt (this file)
+│   └─ Detailed architecture documentation
+│
+└── postman-collection.json
+    └─ API testing collection with pre-built requests
 
-8. Middleware Usage
-----------------------------------------------
-Request pipeline (in order):
+ORGANIZATION PRINCIPLES
+-----------------------
 
-  [All requests]
-  1. cors()                  - Cross-origin headers
-  2. requestLogger()         - Logs method, path, status, duration
-  3. express.json()          - Parses JSON body
-  4. idempotencyGuard()      - Checks Idempotency-Key header for mutations
-  5. apiLimiter (on /api/)   - Sliding window rate limiting (Redis-backed)
+1. Controllers handle HTTP concerns (request parsing, response formatting)
+2. Services handle business logic (transactions, validation, computations)
+3. Middlewares handle cross-cutting concerns (auth, logging, caching)
+4. Models handle domain entities (User, Content, etc.)
+5. Types/Interfaces centralized for reusability
+6. Validators use Zod for type-safe parsing
+7. Workers run separately (background jobs, not in request path)
+8. Utils are pure functions (logger, SingleFlight, etc.)
 
-  [Protected routes only]
-  6. authenticate()          - JWT verification
-  7. roleGuard(['ROLE'])     - Role permission check
+This separation enables:
+  - Easy testing (mock services independently)
+  - Easy replacement (swap storage provider, cache backend, etc.)
+  - Easy reasoning (clear responsibilities)
 
-  [Upload routes]
-  8. uploadMiddleware        - Multer in-memory file parsing
+================================================================================
+8. MIDDLEWARE STACK & REQUEST PIPELINE
+================================================================================
 
-  [Error handling - last]
-  9. errorHandler()          - Catches AppError and unexpected errors, returns JSON
+REQUEST FLOW (In Order)
+-----------------------
 
-9. Scalability Approach
-----------------------------------------------
-Caching:
-  - Redis cache on GET /content/live/:teacherId with dynamic TTL
-  - TTL = seconds remaining until next content rotation
-  - Cache key: live_content:{teacherId}:{subject}
-  - Empty state (no content) is cached for 60 seconds to avoid DB spam
+Incoming HTTP Request
+    ↓
+┌─────────────────────────────────────────────────────────┐
+│ 1. cors()                                               │
+│    Sets Access-Control-* headers                        │
+│    Allows cross-origin requests (configurable)          │
+└─────────────────────────────────────────────────────────┘
+    ↓
+┌─────────────────────────────────────────────────────────┐
+│ 2. requestLogger (custom)                               │
+│    Starts request timer                                 │
+│    Records start of request processing                  │
+└─────────────────────────────────────────────────────────┘
+    ↓
+┌─────────────────────────────────────────────────────────┐
+│ 3. express.json()                                       │
+│    Parses JSON body                                     │
+│    Populates req.body if Content-Type: application/json │
+└─────────────────────────────────────────────────────────┘
+    ↓
+┌─────────────────────────────────────────────────────────┐
+│ 4. idempotencyGuard (custom)                            │
+│    Checks Idempotency-Key header (for POST/PATCH/PUT)   │
+│    Looks up cached response in Redis                    │
+│    If hit: returns cached response immediately (no DB)  │
+│    If miss: intercepts res.json() to cache response     │
+└─────────────────────────────────────────────────────────┘
+    ↓
+┌─────────────────────────────────────────────────────────┐
+│ 5. apiLimiter (on /api/* routes)                        │
+│    Per-IP sliding window rate limiter                   │
+│    Lua script in Redis (atomic)                         │
+│    100 requests/minute per IP                           │
+│    If exceeded: return 429 Too Many Requests            │
+└─────────────────────────────────────────────────────────┘
+    ↓
+┌─────────────────────────────────────────────────────────┐
+│ Route Handlers (specific to endpoint)                   │
+│                                                         │
+│ For protected routes:                                   │
+│ ├─ 6a. authenticate()                                  │
+│ │      Extracts and verifies JWT                        │
+│ │      Checks Redis blocklist                           │
+│ │      Attaches req.user = { id, role }                │
+│ │                                                       │
+│ ├─ 6b. roleGuard(['ROLE'])                             │
+│ │      Checks if user.role matches required roles       │
+│ │      Returns 403 if insufficient permissions          │
+│ │                                                       │
+│ ├─ 6c. uploadMiddleware (for upload routes)            │
+│ │      Parses multipart/form-data                       │
+│ │      Extracts file to req.file                        │
+│ │      Parses form fields to req.body                   │
+│ │                                                       │
+│ └─ 6d. Controller Handler                              │
+│        Zod validation on req.body                       │
+│        Calls service layer                              │
+│        Returns response                                 │
+└─────────────────────────────────────────────────────────┘
+    ↓
+┌─────────────────────────────────────────────────────────┐
+│ 7. errorHandler (global, at end of middleware chain)    │
+│    Catches any thrown errors                            │
+│    Converts AppError → JSON response                    │
+│    Converts unexpected errors → 500                     │
+│    Logs error to Winston                                │
+└─────────────────────────────────────────────────────────┘
+    ↓
+Response sent to client
 
-SingleFlight (Thundering Herd Protection):
-  - When cache expires at a rotation boundary, thousands of students may hit
-    the API simultaneously. Without protection this causes DB connection exhaustion.
-  - SingleFlight collapses all concurrent requests for the same cache key into one
-    DB query. All waiting requests receive the same promise result in-memory.
+DETAILED MIDDLEWARE DESCRIPTIONS
+--------------------------------
 
-Connection Pooling:
-  - pg.Pool with max 20 connections, 30s idle timeout
-  - Prisma uses this pool via the driver adapter (@prisma/adapter-pg)
+1. CORS (cors package)
+   ├─ Enabled for all origins by default
+   ├─ Can be restricted to allowlist in production
+   └─ Sets: Access-Control-Allow-*, Vary headers
 
-Background Analytics:
-  - View events are pushed to a Redis Stream (content_views_stream) instead of
-    writing to PostgreSQL on every request
-  - analyticsWorker.ts consumes the stream in batches and performs bulk upserts
-  - This decouples analytics I/O from the request-response cycle
+2. Request Logger (src/middlewares/logging.middleware.ts)
+   ├─ Listens to res.on('finish') event
+   ├─ Logs: method, path, status, duration (ms), IP, user ID
+   ├─ Winston format: JSON structured logs
+   └─ Useful for: monitoring, debugging, audit trail
 
-Idempotency:
-  - All mutating endpoints accept an Idempotency-Key header
-  - First response is cached in Redis for 24h
-  - Duplicate requests with the same key return the cached response immediately
-  - Prevents double-approval, double-rejection, and double-upload on retries
+3. Express JSON Parser
+   ├─ Built-in express.json()
+   ├─ Parses request body from JSON
+   └─ Populates req.body
 
-Rate Limiting:
-  - Sliding window counter in Redis per IP address
-  - Public /live endpoint: 100 requests per minute per IP
-  - Returns 429 Too Many Requests on breach
+4. Idempotency Guard (src/middlewares/idempotency.ts)
+   ├─ Only applies to: POST, PATCH, PUT
+   ├─ Checks for Idempotency-Key header
+   ├─ Cache key: idempotency:{path}:{key}
+   ├─ TTL: 24 hours (86400 seconds)
+   ├─ Response caching: Only successful 2xx responses cached
+   │
+   │  First request (without Idempotency-Key):
+   │    POST /api/v1/content/upload → Processes, caches response
+   │
+   │  Duplicate request (same Idempotency-Key):
+   │    POST /api/v1/content/upload → Redis hit, returns cached immediately
+   │
+   ├─ Use cases:
+   │   ├─ Network retry protection (user connection dropped)
+   │   ├─ Double-submit protection (user clicks twice)
+   │   ├─ Idempotent uploads (same file, same metadata)
+   │   └─ Approval idempotence (Principal clicks approve twice)
+   │
+   └─ Implementation:
+       originalJson = res.json
+       res.json = (body) => {
+           redis.setex(cacheKey, 24h, JSON.stringify({ status, body }))
+           return originalJson.call(res, body)
+       }
+
+5. Rate Limiter (src/middlewares/rateLimiter.ts)
+   ├─ Algorithm: Sliding Window Counter (Redis Sorted Set)
+   ├─ Per-IP tracking via req.ip
+   ├─ Window: 60 seconds
+   ├─ Limit: 100 requests per minute per IP
+   │
+   │  Lua script (atomic in Redis):
+   │    1. Get all requests from past 60s
+   │    2. Count them
+   │    3. If count >= 100: return 0 (denied)
+   │    4. Else: Add current timestamp, return 1 (allowed)
+   │
+   ├─ Use cases:
+   │   ├─ Protect public /live endpoint from abuse
+   │   ├─ Prevent brute-force auth attempts
+   │   ├─ Prevent resource exhaustion
+   │
+   └─ Response on breach:
+       429 Too Many Requests
+       { error: "Rate limit exceeded" }
+
+6a. Authenticate (src/middlewares/auth.ts)
+    ├─ Extracts Authorization header
+    ├─ Parses "Bearer <token>"
+    ├─ jwt.verify(token, JWT_SECRET)
+    ├─ Checks Redis blocklist: redis.get(`blocklist:${token}`)
+    ├─ If blocklisted: return 401 Token has been revoked
+    ├─ If valid: Attaches req.user = { id, role }
+    └─ If invalid: return 401 Not authorized, invalid token
+
+6b. Role Guard (src/middlewares/auth.ts)
+    ├─ Factory: roleGuard(['PRINCIPAL', 'TEACHER'])
+    ├─ Checks if req.user.role in allowedRoles
+    ├─ If yes: next()
+    └─ If no: return 403 Forbidden: insufficient permissions
+
+6c. Upload Middleware (src/controllers/content.controller.ts)
+    ├─ multer.single('file') parser
+    ├─ memoryStorage: file buffered in memory, not disk
+    ├─ Sets req.file = { fieldname, originalname, encoding, mimetype, size, buffer }
+    ├─ Sets req.body = { title, subject, ... }
+    └─ Note: No size limit enforced here; checked in UploadService
+
+6d. Controller Handler (src/controllers/*.ts)
+    ├─ Receives (req, res, next)
+    ├─ Zod validation: uploadContentSchema.parse(req.body)
+    ├─ Calls service layer: ContentService.createContent()
+    ├─ Returns response: res.status(201).json({ success, data })
+    └─ On error: next(error) passes to errorHandler
+
+7. Error Handler (src/middlewares/errorHandler.ts)
+   ├─ Global error catching middleware
+   ├─ Signature: (err, req, res, next) - 4 parameters (REQUIRED for Express!)
+   ├─ If err instanceof AppError:
+   │   └─ return res.status(err.statusCode).json({ success: false, error: { message } })
+   ├─ Else (unexpected error):
+   │   └─ return res.status(500).json({ success: false, error: { message: "Internal server error" } })
+   └─ Logs to Winston before responding
+
+ERROR EXAMPLES
+--------------
+
+Validation Error (400 Bad Request)
+  Controller: Zod schema validation fails
+  Error: new AppError('Title is required', 400)
+  Response:
+    400 Bad Request
+    { success: false, error: { message: 'Title is required' } }
+
+Authentication Error (401 Unauthorized)
+  Middleware: JWT missing or invalid
+  Response:
+    401 Unauthorized
+    { success: false, error: { message: 'Not authorized, no token provided' } }
+
+Authorization Error (403 Forbidden)
+  Middleware: roleGuard(['PRINCIPAL']) but user is TEACHER
+  Response:
+    403 Forbidden
+    { success: false, error: { message: 'Forbidden: insufficient permissions' } }
+
+Rate Limit Error (429 Too Many Requests)
+  Middleware: apiLimiter sliding window exceeded
+  Response:
+    429 Too Many Requests
+    { error: 'Rate limit exceeded' }
+
+Business Logic Error (409 Conflict)
+  Service: Trying to approve already-approved content
+  Error: new AppError('Cannot modify approved content', 409)
+  Response:
+    409 Conflict
+    { success: false, error: { message: 'Cannot modify approved content' } }
+
+Unexpected Error (500 Internal Server Error)
+  Any: Database connection lost, uncaught exception, etc.
+  Response:
+    500 Internal Server Error
+    { success: false, error: { message: 'Internal server error' } }
+    (Details not exposed to client for security)
+
+KEY FILES
+---------
+src/middlewares/auth.ts              ← JWT verification + role checking
+src/middlewares/errorHandler.ts      ← AppError class + global handler
+src/middlewares/idempotency.ts       ← Idempotency-Key header + caching
+src/middlewares/rateLimiter.ts       ← Sliding window rate limiting
+src/middlewares/logging.middleware.ts ← Winston request logging
+
+================================================================================
+9. SCALABILITY APPROACH (Caching, Queues, Performance)
+================================================================================
+
+PROBLEM: High Load Broadcasting
+-------------------------------
+
+Peak scenario:
+  - 10,000 students requesting /content/live/:teacherId simultaneously
+  - If each hits database, connection pool exhausted
+  - Database becomes bottleneck
+  - Response latency > 5 seconds
+  - System becomes unusable
+
+SOLUTION: Multi-Layer Caching + Request Collapsing
+
+Layer 1: Redis Cache (Hot Content Cache)
+==========================================
+
+Key: live_content:{teacherId}:{subject}
+TTL: Dynamic (expires exactly at rotation boundary)
+Lookup: O(1) Redis GET (sub-millisecond)
+
+Example:
+  Teacher: teacher-123
+  Subject: maths
+  Key: live_content:teacher-123:maths
+  Cached value: { content: { id, title, fileUrl, ... }, rotationInfo: { ... } }
+  TTL: 180 seconds (until next rotation at 10:05:00)
+
+Hit Rate Estimation:
+  - Thousands of students hitting same teacher/subject
+  - Cache hit within 180 seconds
+  - Hit rate: 99%+ (only misses at exact rotation boundary)
+
+Cache Invalidation (Perfect):
+  - No TTL guessing
+  - No manual invalidation
+  - Cache expires exactly when content changes
+  - Zero stale data
+  - Simplest, most efficient approach
+
+Layer 2: SingleFlight Request Collapsing
 =========================================
+
+Problem: What happens at rotation boundary when all students hit expired cache?
+
+Without SingleFlight:
+  10,000 concurrent requests
+    ├─ All check Redis cache (all miss)
+    ├─ All execute database query
+    ├─ All computation (rotation algorithm)
+    └─ Result: 10,000 DB connections, "thundering herd"
+
+With SingleFlight:
+  10,000 concurrent requests
+    ├─ Request 1: Acquires lock, executes DB query + algorithm
+    ├─ Requests 2-10,000: Wait for Request 1 to complete
+    ├─ Request 1 completes, all 10,000 receive same promise result
+    └─ Result: 1 DB connection, all satisfied in-memory
+
+Implementation: src/utils/singleFlight.ts
+
+class SingleFlight {
+    private activeCalls: Map<string, Promise<any>> = new Map();
+
+    async do<T>(key: string, fn: () => Promise<T>): Promise<T> {
+        // If same operation is in-flight, wait for it
+        if (this.activeCalls.has(key)) {
+            return this.activeCalls.get(key);
+        }
+
+        // Start the operation
+        const promise = fn().finally(() => {
+            this.activeCalls.delete(key); // Cleanup
+        });
+
+        this.activeCalls.set(key, promise);
+        return promise;
+    }
+}
+
+Usage in BroadcastService:
+  const result = await singleFlight.do(cacheKey, async () => {
+      // Database query + rotation algorithm
+      const activeContent = await SchedulingService.getActiveContent(...);
+      // Cache it
+      await redis.setex(cacheKey, ttl, JSON.stringify(result));
+      return result;
+  });
+
+Performance Impact:
+  - Without: 10,000 concurrent DB queries, ~5s latency
+  - With: 1 DB query, ~50ms latency for all
+
+Layer 3: Connection Pooling
+============================
+
+PostgreSQL Connection Pool Configuration:
+  src/config/prisma.ts
+
+  const pool = new pg.Pool({
+      connectionString: process.env.DATABASE_URL,
+      max: 20,              // Max connections
+      idleTimeoutMillis: 30000,  // Reclaim idle after 30s
+  });
+
+Why max: 20?
+  - Typical request uses 1-2 connections
+  - 20 connections handle ~10 concurrent requests
+  - Combined with caching, DB is rarely hit
+  - More connections = more memory overhead
+
+Idle timeout: 30 seconds
+  - Reclaim connections after 30s of inactivity
+  - Prevents connection leak
+  - Dynamically scales down during low traffic
+
+Layer 4: Background Analytics (Async, Non-Blocking)
+====================================================
+
+Problem: Every view tracked = database write = slow response
+
+Without async:
+  GET /live/:teacher → Compute content (fast, cached) → Write to Analytics DB
+    └─ Response blocked on Analytics write → ~100-200ms latency
+
+With async:
+  GET /live/:teacher → Compute content → redis.xadd('stream', ...) (fast)
+  └─ Response sent immediately (~50ms)
+    
+  Separate worker process:
+    ├─ Consumes Redis Stream
+    ├─ Batches 50 view events
+    ├─ Bulk upsert to Analytics table (1 query for 50 views)
+    └─ Decouples analytics from request path
+
+Implementation:
+
+In broadcast.service.ts:
+  this.trackView(contentId, teacherId, subject);
+  
+  private static trackView(...) {
+      redis.xadd(
+          'content_views_stream',
+          '*',
+          'content_id', contentId,
+          'teacher_id', teacherId,
+          'subject', subject,
+          'timestamp', Date.now()
+      ).catch(err => logger.error('Analytics failed', err));
+  }
+
+In workers/analyticsWorker.ts (separate process):
+  while (true) {
+      const messages = await redis.xreadgroup(
+          'GROUP', 'analytics_workers', consumerId,
+          'COUNT', 50,
+          'BLOCK', 5000,
+          'STREAMS', 'content_views_stream', '>'
+      );
+
+      // Aggregate 50 messages
+      const aggregation = {}; // contentId -> count
+      for (const [id, fields] of messages) {
+          const contentId = fields.content_id;
+          aggregation[contentId] = (aggregation[contentId] || 0) + 1;
+      }
+
+      // Bulk upsert
+      await Promise.all(
+          Object.entries(aggregation).map(([contentId, count]) =>
+              prisma.analytics.upsert({
+                  where: { idx_content_date: { contentId, date: today } },
+                  update: { viewCount: { increment: count } },
+                  create: { contentId, ..., viewCount: count }
+              })
+          )
+      );
+
+      // Acknowledge successful processing
+      await redis.xack('content_views_stream', 'analytics_workers', ...messageIds);
+  }
+
+Benefits:
+  - Request latency: ~50ms (without analytics blocking)
+  - Analytics delay: 5-10 minutes (batched, acceptable)
+  - Database write reduction: 1000x (1 query per 50 views vs 50 queries)
+  - Fault tolerance: If worker crashes, Redis Stream persists events for replay
+
+Queuing Strategy:
+  Redis Streams instead of RabbitMQ/Kafka because:
+    ├─ Simpler: No external service, built into Redis
+    ├─ Ordering: Events processed in order per stream
+    ├─ Durability: Persisted to disk if appendonly.aof enabled
+    ├─ Consumer groups: Automatic load balancing across workers
+    └─ Replay: Can re-read events if worker fails
+
+SUMMARY: CACHING STACK
+=======================
+
+Request for /content/live/:teacher?subject=maths
+
+  ┌─────────────────────────────────────────────────┐
+  │ Is Redis cache hot?                             │
+  │ (live_content:teacher:maths)                    │
+  └──────────────────────────────────────────────────┘
+         │
+         ├─ YES (99% of requests)
+         │  └─ Return from Redis (<1ms)
+         │
+         └─ NO (rotation boundary)
+            ├─ SingleFlight lock?
+            │
+            ├─ YES (Request 2-10000)
+            │  └─ Wait for Request 1 (in-memory)
+            │
+            └─ NO (Request 1)
+               ├─ Query DB: SELECT ... FROM Content WHERE ...
+               ├─ Compute rotation algorithm
+               ├─ Cache to Redis with dynamic TTL
+               ├─ All waiting requests complete
+               └─ Return to client
+
+Total latency:
+  Cache hit (99%):  ~1ms
+  Cache miss (1%):  ~50ms (1 DB query + algorithm + cache)
+
+Database load:
+  Without layers:  10,000 queries at rotation boundary
+  With layers:     1 query at rotation boundary
+
+KEY FILES
+---------
+src/services/broadcast.service.ts    ← Redis caching + SingleFlight
+src/utils/singleFlight.ts            ← Request collapsing logic
+src/config/prisma.ts                 ← Connection pooling
+src/workers/analyticsWorker.ts       ← Background analytics
+src/middlewares/rateLimiter.ts       ← Additional protection
+
+================================================================================
+10. DEPLOYMENT & OPERATIONS
+================================================================================
+
+ENVIRONMENT VARIABLES
+---------------------
+
+Required:
+  DATABASE_URL=postgresql://user:password@localhost:5432/cbs_db
+  REDIS_URL=redis://localhost:6379
+  JWT_SECRET=your-strong-secret-key-32-chars-min
+
+Optional:
+  PORT=3000 (default)
+  LOG_LEVEL=info (debug, info, warn, error)
+  STORAGE=local (or s3 for S3 backend)
+  NODE_ENV=development (or production)
+
+Production recommendations:
+  - Use environment variables for all secrets
+  - Never commit .env to version control
+  - Use strong JWT_SECRET (32+ random chars)
+  - Set LOG_LEVEL=warn to reduce I/O
+  - Use external PostgreSQL (managed service)
+  - Use external Redis (managed service)
+
+RUNNING THE APPLICATION
+-----------------------
+
+Development:
+  npm install
+  docker-compose up -d (PostgreSQL + Redis)
+  npx prisma migrate deploy
+  npx prisma generate
+  npm run dev (starts server + hot reload)
+
+Running Analytics Worker (separate terminal):
+  npm run worker
+
+Running Tests:
+  npm test (all tests)
+  npm test -- unit (unit tests only)
+  npm test -- integration (integration tests only)
+
+Production:
+  npm run build (TypeScript → JavaScript)
+  npm start (runs dist/server.js)
+
+MONITORING & OBSERVABILITY
+--------------------------
+
+Request Logging:
+  Winston logger outputs JSON to stdout
+  Typical format:
+    {
+      "level": "info",
+      "message": "HTTP Request",
+      "timestamp": "2026-04-26T10:30:45.123Z",
+      "method": "GET",
+      "path": "/api/v1/content/live/teacher-123",
+      "status": 200,
+      "duration": "45ms",
+      "ip": "192.168.1.1",
+      "cached": true
+    }
+
+Metrics to track:
+  - Request latency (p50, p95, p99)
+  - Error rate (4xx, 5xx)
+  - Cache hit rate (for /live endpoint)
+  - Database query latency
+  - Redis latency
+  - Worker lag (messages in pending list)
+  - Rotation correctness (verify active content matches calculation)
+
+Health Check:
+  GET /health
+  200 { status: "ok" }
+
+SCALING CONSIDERATIONS
+---------------------
+
+Horizontal Scaling (Multiple Instances):
+  ├─ Stateless: Each instance can be killed/replaced
+  ├─ Shared storage: PostgreSQL + Redis (external, shared)
+  ├─ Load balancer: Round-robin or sticky session (not required)
+  ├─ No session affinity needed (rotation is deterministic)
+  └─ Start N instances behind load balancer
+
+Vertical Scaling (More Powerful Machine):
+  ├─ Increase CPU: Faster request processing
+  ├─ Increase RAM: Larger Node.js heap for caching
+  ├─ Increase bandwidth: Faster file downloads
+  └─ Increase PostgreSQL connections: pool.max = 50 (if needed)
+
+Database Scaling:
+  ├─ Read replicas: For analytics queries
+  ├─ Connection pooling: pgBouncer or PgPool (already configured)
+  ├─ Indexes: [status, createdAt], [subject, status] (already created)
+  ├─ Partitioning: If billions of content items, partition by teacher_id
+  └─ Archiving: Move old approved content to cold storage
+
+Redis Scaling:
+  ├─ Single instance: Suitable for <10 million daily active users
+  ├─ Replication: For high availability (master-slave)
+  ├─ Cluster: For massive scale (sharding by key)
+  └─ Persistence: Enable appendonly.aof for durability
+
+================================================================================
+END OF ARCHITECTURE NOTES
+================================================================================
+
+For more details, see:
+  - README.md (Quick start)
+  - postman-collection.json (API testing)
+  - src/ folder (Source code)
